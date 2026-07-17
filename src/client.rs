@@ -83,9 +83,7 @@ impl SseParser {
 }
 
 fn find_subsequence(haystack: &[u8], needle: &[u8]) -> Option<usize> {
-    haystack
-        .windows(needle.len())
-        .position(|w| w == needle)
+    haystack.windows(needle.len()).position(|w| w == needle)
 }
 
 /// Extract the content delta (if any) from a single SSE event.
@@ -148,7 +146,11 @@ impl ChatClient {
     ///
     /// Retries retryable failures (timeouts, 429, 5xx, network) with
     /// exponential backoff + jitter, but only *before* any output is shown.
-    pub async fn stream_complete<F>(&self, messages: &[Message], mut on_delta: F) -> Result<String, ChatError>
+    pub async fn stream_complete<F>(
+        &self,
+        messages: &[Message],
+        mut on_delta: F,
+    ) -> Result<String, ChatError>
     where
         F: FnMut(&str),
     {
@@ -157,11 +159,12 @@ impl ChatClient {
             let mut emitted = false;
             // Wrap the caller's callback so we can observe whether any output
             // was produced; if so, suppress retry on later failure.
-            let result = self.try_once(messages, |delta| {
-                emitted = true;
-                on_delta(delta);
-            })
-            .await;
+            let result = self
+                .try_once(messages, |delta| {
+                    emitted = true;
+                    on_delta(delta);
+                })
+                .await;
 
             match result {
                 Ok(content) => return Ok(content),
@@ -211,17 +214,13 @@ impl ChatClient {
 
         let mut response = response;
 
-        while let Some(chunk) = response
-            .chunk()
-            .await
-            .map_err(|e| {
-                if stream_started {
-                    ChatError::StreamInterrupted(e.to_string())
-                } else {
-                    classify_reqwest_error(&e)
-                }
-            })?
-        {
+        while let Some(chunk) = response.chunk().await.map_err(|e| {
+            if stream_started {
+                ChatError::StreamInterrupted(e.to_string())
+            } else {
+                classify_reqwest_error(&e)
+            }
+        })? {
             parser.push(&chunk);
             for event in parser.drain_events() {
                 match parse_event(&event) {
@@ -319,7 +318,7 @@ mod tests {
         // First push: an incomplete event (no trailing blank line yet).
         p.push(b"data: {\"choices\":[{\"delta\":{\"content\":\"He\"}}]}\n");
         assert!(p.drain_events().is_empty()); // incomplete: needs blank line
-        // Second push completes the event separator.
+                                              // Second push completes the event separator.
         p.push(b"\n");
         let evs = p.drain_events();
         assert_eq!(evs.len(), 1);
@@ -430,7 +429,12 @@ mod tests {
     #[test]
     fn should_not_retry_non_retryable_errors() {
         assert!(!should_retry(false, &ChatError::Auth("k".into()), 1, 3));
-        assert!(!should_retry(false, &ChatError::InvalidRequest("b".into()), 1, 3));
+        assert!(!should_retry(
+            false,
+            &ChatError::InvalidRequest("b".into()),
+            1,
+            3
+        ));
         assert!(!should_retry(false, &ChatError::EmptyResponse, 1, 3));
     }
 

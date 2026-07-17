@@ -98,12 +98,14 @@ async fn main() -> Result<(), Box<dyn Error>> {
     // OPENROUTER_MODEL: .env authoritative; fallback to openrouter/auto.
     let model = env::var("OPENROUTER_MODEL").unwrap_or_else(|_| "openrouter/auto".to_string());
 
-    let timeout_secs: u64 = env_or_default("OPENROUTER_TIMEOUT_SECS", &DEFAULT_TIMEOUT_SECS.to_string())
-        .parse()
-        .unwrap_or(DEFAULT_TIMEOUT_SECS);
-    let max_retries: u32 = env_or_default("OPENROUTER_MAX_RETRIES", &DEFAULT_MAX_RETRIES.to_string())
-        .parse()
-        .unwrap_or(DEFAULT_MAX_RETRIES);
+    let timeout_secs: u64 =
+        env_or_default("OPENROUTER_TIMEOUT_SECS", &DEFAULT_TIMEOUT_SECS.to_string())
+            .parse()
+            .unwrap_or(DEFAULT_TIMEOUT_SECS);
+    let max_retries: u32 =
+        env_or_default("OPENROUTER_MAX_RETRIES", &DEFAULT_MAX_RETRIES.to_string())
+            .parse()
+            .unwrap_or(DEFAULT_MAX_RETRIES);
     let max_context_tokens: usize = env_or_default(
         "OPENROUTER_MAX_CONTEXT_TOKENS",
         &DEFAULT_MAX_CONTEXT_TOKENS.to_string(),
@@ -111,7 +113,9 @@ async fn main() -> Result<(), Box<dyn Error>> {
     .parse()
     .unwrap_or(DEFAULT_MAX_CONTEXT_TOKENS);
 
-    let http = Client::builder().timeout(Duration::from_secs(timeout_secs)).build()?;
+    let http = Client::builder()
+        .timeout(Duration::from_secs(timeout_secs))
+        .build()?;
     let chat_client = ChatClient::new(http, api_key, model.clone(), max_retries);
 
     let mut conversation = Conversation::new(

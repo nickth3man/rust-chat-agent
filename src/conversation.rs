@@ -132,7 +132,11 @@ mod tests {
             c.push(assistant(&format!("reply {i} with padding text here")));
         }
         // Should have trimmed well below 40 messages.
-        assert!(c.len() <= 5, "expected aggressive trim, got len {}", c.len());
+        assert!(
+            c.len() <= 5,
+            "expected aggressive trim, got len {}",
+            c.len()
+        );
         assert!(c.total_tokens() <= 50);
     }
 
