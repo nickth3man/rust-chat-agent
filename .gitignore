@@ -1,0 +1,12 @@
+# Rust build artifacts
+/target/
+
+# Local environment files (secrets — never commit)
+.env
+.env.*
+!.env.example
+
+# IDE / editor
+.idea/
+.vscode/
+*.swp
