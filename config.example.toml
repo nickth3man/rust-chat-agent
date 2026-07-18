@@ -1,0 +1,225 @@
+# Copy this file to config.toml, then put secrets in .env.
+
+[models]
+chat_id = "openrouter/auto"
+rank_id = "openrouter/auto"
+summarize_id = "openrouter/auto"
+chat_context_tokens = 12000
+
+[search]
+stage_budget_secs = 20
+rank_timeout_secs = 20
+per_backend_hit_cap = 5
+model_output_bytes = 6144
+
+[session]
+log_directory = "sessions"
+redact_credentials = true
+redact_auth_headers = true
+
+[fetch]
+timeout_secs = 20
+max_bytes = 2000000
+max_chars = 50000
+allowed_schemes = ["http", "https"]
+allowed_media_types = ["text/html", "text/plain", "application/xhtml+xml", "application/json", "text/xml", "application/xml"]
+redirect_limit = 5
+
+# Key-free providers are enabled by default.
+# Provider User-Agent values identify this project by its public repository URL.
+[providers.duckduckgo]
+enable = true
+concurrency = 1
+min_interval_ms = 1000
+timeout_secs = 6
+user_agent = "openrouter-chat-rust/0.1 (+https://github.com/nickth3man/rust-chat-agent)"
+
+[providers.stract]
+enable = true
+concurrency = 1
+min_interval_ms = 1000
+timeout_secs = 6
+user_agent = "openrouter-chat-rust/0.1 (+https://github.com/nickth3man/rust-chat-agent)"
+
+[providers.marginalia]
+enable = true
+concurrency = 1
+min_interval_ms = 1000
+timeout_secs = 6
+user_agent = "openrouter-chat-rust/0.1 (+https://github.com/nickth3man/rust-chat-agent)"
+
+[providers.mwmbl]
+enable = true
+concurrency = 1
+min_interval_ms = 1000
+timeout_secs = 6
+user_agent = "openrouter-chat-rust/0.1 (+https://github.com/nickth3man/rust-chat-agent)"
+
+[providers.wiby]
+enable = true
+concurrency = 1
+min_interval_ms = 1000
+timeout_secs = 6
+user_agent = "openrouter-chat-rust/0.1 (+https://github.com/nickth3man/rust-chat-agent)"
+
+[providers.searchmysite]
+enable = true
+concurrency = 1
+min_interval_ms = 1000
+timeout_secs = 6
+user_agent = "openrouter-chat-rust/0.1 (+https://github.com/nickth3man/rust-chat-agent)"
+
+[providers.wikipedia]
+enable = true
+concurrency = 1
+min_interval_ms = 1000
+timeout_secs = 6
+user_agent = "openrouter-chat-rust/0.1 (+https://github.com/nickth3man/rust-chat-agent)"
+
+[providers.wikidata]
+enable = true
+concurrency = 1
+min_interval_ms = 1000
+timeout_secs = 6
+user_agent = "openrouter-chat-rust/0.1 (+https://github.com/nickth3man/rust-chat-agent)"
+
+[providers.openlibrary]
+enable = true
+concurrency = 1
+min_interval_ms = 1000
+timeout_secs = 6
+user_agent = "openrouter-chat-rust/0.1 (+https://github.com/nickth3man/rust-chat-agent)"
+
+[providers.free_dictionary]
+enable = true
+concurrency = 1
+min_interval_ms = 1000
+timeout_secs = 6
+user_agent = "openrouter-chat-rust/0.1 (+https://github.com/nickth3man/rust-chat-agent)"
+
+[providers.arxiv]
+enable = true
+concurrency = 1
+min_interval_ms = 3000
+timeout_secs = 6
+user_agent = "openrouter-chat-rust/0.1 (+https://github.com/nickth3man/rust-chat-agent)"
+
+[providers.crossref]
+enable = true
+concurrency = 1
+min_interval_ms = 1000
+timeout_secs = 6
+user_agent = "openrouter-chat-rust/0.1 (+https://github.com/nickth3man/rust-chat-agent)"
+
+[providers.semantic_scholar]
+enable = true
+concurrency = 1
+min_interval_ms = 1000
+timeout_secs = 6
+user_agent = "openrouter-chat-rust/0.1 (+https://github.com/nickth3man/rust-chat-agent)"
+
+[providers.pubmed]
+enable = true
+concurrency = 1
+min_interval_ms = 1000
+timeout_secs = 6
+user_agent = "openrouter-chat-rust/0.1 (+https://github.com/nickth3man/rust-chat-agent)"
+
+[providers.hn]
+enable = true
+concurrency = 1
+min_interval_ms = 1000
+timeout_secs = 6
+user_agent = "openrouter-chat-rust/0.1 (+https://github.com/nickth3man/rust-chat-agent)"
+
+[providers.github]
+enable = true
+optional_api_key_env = "GITHUB_TOKEN"
+concurrency = 1
+min_interval_ms = 1000
+timeout_secs = 6
+user_agent = "openrouter-chat-rust/0.1 (+https://github.com/nickth3man/rust-chat-agent)"
+
+[providers.stackexchange]
+enable = true
+optional_api_key_env = "STACKEXCHANGE_KEY"
+concurrency = 1
+min_interval_ms = 1000
+timeout_secs = 6
+user_agent = "openrouter-chat-rust/0.1 (+https://github.com/nickth3man/rust-chat-agent)"
+
+[providers.npm]
+enable = true
+concurrency = 1
+min_interval_ms = 1000
+timeout_secs = 6
+user_agent = "openrouter-chat-rust/0.1 (+https://github.com/nickth3man/rust-chat-agent)"
+
+[providers.crates_io]
+enable = true
+concurrency = 1
+min_interval_ms = 1000
+timeout_secs = 6
+user_agent = "openrouter-chat-rust/0.1 (+https://github.com/nickth3man/rust-chat-agent)"
+
+[providers.mdn]
+enable = true
+concurrency = 1
+min_interval_ms = 1000
+timeout_secs = 6
+user_agent = "openrouter-chat-rust/0.1 (+https://github.com/nickth3man/rust-chat-agent)"
+
+[providers.gdelt]
+enable = true
+concurrency = 1
+min_interval_ms = 1000
+timeout_secs = 6
+user_agent = "openrouter-chat-rust/0.1 (+https://github.com/nickth3man/rust-chat-agent)"
+
+[providers.reddit]
+enable = true
+concurrency = 1
+min_interval_ms = 1000
+timeout_secs = 6
+user_agent = "openrouter-chat-rust/0.1 (+https://github.com/nickth3man/rust-chat-agent)"
+
+[providers.lobsters]
+enable = true
+concurrency = 1
+min_interval_ms = 1000
+timeout_secs = 6
+user_agent = "openrouter-chat-rust/0.1 (+https://github.com/nickth3man/rust-chat-agent)"
+
+# Optional keyed providers. Firecrawl is web-only and uses the normal five-result cap.
+[providers.brave]
+enable = false
+api_key_env = "BRAVE_API_KEY"
+concurrency = 1
+min_interval_ms = 1000
+timeout_secs = 6
+user_agent = "openrouter-chat-rust/0.1 (+https://github.com/nickth3man/rust-chat-agent)"
+
+[providers.mojeek]
+enable = false
+api_key_env = "MOJEEK_API_KEY"
+concurrency = 1
+min_interval_ms = 1000
+timeout_secs = 6
+user_agent = "openrouter-chat-rust/0.1 (+https://github.com/nickth3man/rust-chat-agent)"
+
+[providers.searxng]
+enable = false
+concurrency = 1
+min_interval_ms = 1000
+timeout_secs = 6
+user_agent = "openrouter-chat-rust/0.1 (+https://github.com/nickth3man/rust-chat-agent)"
+base_url_env = "SEARXNG_BASE_URL"
+
+[providers.firecrawl]
+enable = false
+api_key_env = "FIRECRAWL_API_KEY"
+concurrency = 1
+min_interval_ms = 1000
+timeout_secs = 15
+user_agent = "openrouter-chat-rust/0.1 (+https://github.com/nickth3man/rust-chat-agent)"
+base_url = "https://api.firecrawl.dev/v2/search"
