@@ -179,13 +179,12 @@ pub fn resolve_inputs(
             .api_key_env
             .as_deref()
             .filter(|key| !key.trim().is_empty())
+            && api_key.as_deref().is_none_or(|key| key.trim().is_empty())
         {
-            if api_key.as_deref().is_none_or(|key| key.trim().is_empty()) {
-                return Err(AppError::MissingCredential {
-                    provider: name.clone(),
-                    env_var: env_var.to_owned(),
-                });
-            }
+            return Err(AppError::MissingCredential {
+                provider: name.clone(),
+                env_var: env_var.to_owned(),
+            });
         }
         let optional_api_key = provider
             .optional_api_key_env

@@ -132,10 +132,10 @@ impl FetchPage {
                         || response.status() == StatusCode::TOO_MANY_REQUESTS
                         || response.status().is_server_error();
                     if retry && attempt == 0 {
-                        if let Some(delay) = retry_after(&response) {
-                            if delay <= Duration::from_secs(self.config.timeout_secs) {
-                                tokio::time::sleep(delay).await;
-                            }
+                        if let Some(delay) = retry_after(&response)
+                            && delay <= Duration::from_secs(self.config.timeout_secs)
+                        {
+                            tokio::time::sleep(delay).await;
                         }
                         attempt = 1;
                         continue;
