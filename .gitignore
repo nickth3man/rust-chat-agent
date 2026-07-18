@@ -13,5 +13,22 @@
 .vscode/
 *.swp
 
+# Rust tooling artifacts
+*.rs.bk
+mutants-out/
+
+# Profiling
+*.profraw
+*.profdata
+perf.data*
+flamegraph*
+heaptrack*
+massif*
+callgrind*
+cachegrind*
+
+# Local cargo
+.cargo/
+
 # Local deepwork progress state
 .slim/deepwork/
