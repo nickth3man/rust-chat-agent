@@ -77,9 +77,6 @@ impl SessionLogger {
     pub fn path(&self) -> &Path {
         self.path.as_path()
     }
-    pub fn log_path(&self) -> &Path {
-        self.path()
-    }
 
     pub async fn snapshot(&self) -> SessionDocument {
         self.document.lock().await.clone()
@@ -88,9 +85,6 @@ impl SessionLogger {
     pub async fn record_transcript(&self, mut entry: TranscriptEntry) -> Result<(), AppError> {
         entry.content = self.scrub(&entry.content);
         self.mutate(|doc| doc.transcript.push(entry)).await
-    }
-    pub async fn record_transcript_entry(&self, entry: TranscriptEntry) -> Result<(), AppError> {
-        self.record_transcript(entry).await
     }
     pub async fn record_user(&self, timestamp: String, content: String) -> Result<(), AppError> {
         self.record_transcript(TranscriptEntry {
@@ -129,9 +123,6 @@ impl SessionLogger {
             .map_err(|_| AppError::SessionLog("sanitize event failed".into()))?;
         self.mutate(|doc| doc.events.push(event)).await
     }
-    pub async fn record_logical_event(&self, event: LogicalEvent) -> Result<(), AppError> {
-        self.record_event(event).await
-    }
     pub async fn record_provenance(&self, provenance: TurnProvenance) -> Result<(), AppError> {
         let value = self.scrub_value(
             serde_json::to_value(provenance)
@@ -140,9 +131,6 @@ impl SessionLogger {
         let provenance = serde_json::from_value(value)
             .map_err(|_| AppError::SessionLog("sanitize provenance failed".into()))?;
         self.mutate(|doc| doc.provenance.push(provenance)).await
-    }
-    pub async fn record_turn_provenance(&self, provenance: TurnProvenance) -> Result<(), AppError> {
-        self.record_provenance(provenance).await
     }
 
     pub async fn record_search_activity(&self, activity: SearchActivity) -> Result<(), AppError> {
@@ -256,9 +244,6 @@ impl SessionLogger {
                 .await
             }
         }
-    }
-    pub async fn record_activity(&self, activity: SearchActivity) -> Result<(), AppError> {
-        self.record_search_activity(activity).await
     }
 
     async fn mutate<F>(&self, update: F) -> Result<(), AppError>

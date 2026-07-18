@@ -158,19 +158,29 @@ struct RuntimeServices<'a> {
     logger_state: &'a LoggerState,
 }
 
+async fn report_log_inner<T>(
+    state: &LoggerState,
+    operation: &str,
+    result: Result<T, impl std::fmt::Display>,
+    essential: bool,
+) {
+    if let Err(error) = result {
+        let message = render::sanitize_terminal_text(&safe_text(&error.to_string()));
+        if essential {
+            state.0.store(true, Ordering::Relaxed);
+            eprintln!("warning: essential session logging failed ({operation}): {message}");
+        } else if !state.0.swap(true, Ordering::Relaxed) {
+            eprintln!("warning: session logging degraded ({operation}): {message}");
+        }
+    }
+}
+
 async fn report_log<T>(
     state: &LoggerState,
     operation: &str,
     result: Result<T, impl std::fmt::Display>,
 ) {
-    if let Err(error) = result {
-        if !state.0.swap(true, Ordering::Relaxed) {
-            eprintln!(
-                "warning: session logging degraded ({operation}): {}",
-                render::sanitize_terminal_text(&safe_text(&error.to_string()))
-            );
-        }
-    }
+    report_log_inner(state, operation, result, false).await;
 }
 
 async fn report_essential_log<T>(
@@ -178,13 +188,7 @@ async fn report_essential_log<T>(
     operation: &str,
     result: Result<T, impl std::fmt::Display>,
 ) {
-    if let Err(error) = result {
-        state.0.store(true, Ordering::Relaxed);
-        eprintln!(
-            "warning: essential session logging failed ({operation}): {}",
-            render::sanitize_terminal_text(&safe_text(&error.to_string()))
-        );
-    }
+    report_log_inner(state, operation, result, true).await;
 }
 
 async fn show_memory_event(logger: &SessionLogger, logger_state: &LoggerState, event: MemoryEvent) {
@@ -231,20 +235,74 @@ async fn drain_side_logs(state: &MetaSearchState, memory: &ProductionMemory) {
     let _ = memory.take_events();
 }
 
-async fn drain_queued_events(
-    activities: &mut broadcast::Receiver<SearchActivity>,
-    memory_events: &mut broadcast::Receiver<MemoryEvent>,
+/// Track a rendered event so side-log drain can skip the same publication.
+fn note_rendered(rendered: &mut HashMap<String, usize>, event: &impl std::fmt::Debug) {
+    let key = format!("{event:?}");
+    *rendered.entry(key).or_default() += 1;
+}
+
+/// Drop one matching side-log entry; returns true if the event was already shown.
+fn consume_rendered(rendered: &mut HashMap<String, usize>, event: &impl std::fmt::Debug) -> bool {
+    let key = format!("{event:?}");
+    let Some(count) = rendered.get_mut(&key) else {
+        return false;
+    };
+    *count -= 1;
+    if *count == 0 {
+        rendered.remove(&key);
+    }
+    true
+}
+
+async fn on_activity_recv(
+    result: Result<SearchActivity, broadcast::error::RecvError>,
     services: RuntimeServices<'_>,
-    rendered_activities: &mut HashMap<String, usize>,
-    rendered_memory_events: &mut HashMap<String, usize>,
+    rendered: &mut HashMap<String, usize>,
+) -> bool {
+    match result {
+        Ok(event) => {
+            note_rendered(rendered, &event);
+            show_activity(services.logger, services.logger_state, event).await;
+            true
+        }
+        Err(broadcast::error::RecvError::Lagged(n)) => {
+            eprintln!("warning: missed {n} search activity events");
+            true
+        }
+        Err(_) => false,
+    }
+}
+
+async fn on_memory_recv(
+    result: Result<MemoryEvent, broadcast::error::RecvError>,
+    services: RuntimeServices<'_>,
+    rendered: &mut HashMap<String, usize>,
+) -> bool {
+    match result {
+        Ok(event) => {
+            note_rendered(rendered, &event);
+            show_memory_event(services.logger, services.logger_state, event).await;
+            true
+        }
+        Err(broadcast::error::RecvError::Lagged(n)) => {
+            eprintln!("warning: missed {n} memory events");
+            true
+        }
+        Err(_) => false,
+    }
+}
+
+async fn drain_try_recv_activities(
+    activities: &mut broadcast::Receiver<SearchActivity>,
+    services: RuntimeServices<'_>,
+    rendered: &mut HashMap<String, usize>,
 ) -> bool {
     let mut visible = false;
     loop {
         match activities.try_recv() {
             Ok(event) => {
                 visible = true;
-                let key = format!("{event:?}");
-                *rendered_activities.entry(key).or_default() += 1;
+                note_rendered(rendered, &event);
                 show_activity(services.logger, services.logger_state, event).await;
             }
             Err(broadcast::error::TryRecvError::Lagged(n)) => {
@@ -256,12 +314,20 @@ async fn drain_queued_events(
             }
         }
     }
+    visible
+}
+
+async fn drain_try_recv_memory(
+    memory_events: &mut broadcast::Receiver<MemoryEvent>,
+    services: RuntimeServices<'_>,
+    rendered: &mut HashMap<String, usize>,
+) -> bool {
+    let mut visible = false;
     loop {
         match memory_events.try_recv() {
             Ok(event) => {
                 visible = true;
-                let key = format!("{event:?}");
-                *rendered_memory_events.entry(key).or_default() += 1;
+                note_rendered(rendered, &event);
                 show_memory_event(services.logger, services.logger_state, event).await;
             }
             Err(broadcast::error::TryRecvError::Lagged(n)) => {
@@ -273,31 +339,30 @@ async fn drain_queued_events(
             }
         }
     }
+    visible
+}
+
+async fn drain_queued_events(
+    activities: &mut broadcast::Receiver<SearchActivity>,
+    memory_events: &mut broadcast::Receiver<MemoryEvent>,
+    services: RuntimeServices<'_>,
+    rendered_activities: &mut HashMap<String, usize>,
+    rendered_memory_events: &mut HashMap<String, usize>,
+) -> bool {
+    let mut visible = false;
+    visible |= drain_try_recv_activities(activities, services, rendered_activities).await;
+    visible |= drain_try_recv_memory(memory_events, services, rendered_memory_events).await;
     // The broadcast receiver and the side log are fed by the same publication.
     // Render anything that was published before subscription (or was missed by
     // select), but consume matching entries so an event is never shown twice.
     for event in services.state.take_activities().await {
-        let key = format!("{event:?}");
-        if let Some(count) = rendered_activities.get_mut(&key) {
-            *count -= 1;
-            let exhausted = *count == 0;
-            if exhausted {
-                rendered_activities.remove(&key);
-            }
-        } else {
+        if !consume_rendered(rendered_activities, &event) {
             visible = true;
             show_activity(services.logger, services.logger_state, event).await;
         }
     }
     for event in services.memory.take_events() {
-        let key = format!("{event:?}");
-        if let Some(count) = rendered_memory_events.get_mut(&key) {
-            *count -= 1;
-            let exhausted = *count == 0;
-            if exhausted {
-                rendered_memory_events.remove(&key);
-            }
-        } else {
+        if !consume_rendered(rendered_memory_events, &event) {
             visible = true;
             show_memory_event(services.logger, services.logger_state, event).await;
         }
@@ -315,6 +380,80 @@ fn collect_tool_result(result: &rig_core::message::ToolResult) -> String {
         })
         .collect::<Vec<_>>()
         .join("\n")
+}
+
+async fn handle_tool_start(
+    services: RuntimeServices<'_>,
+    tool_call: &rig_core::message::ToolCall,
+    retries: u8,
+) {
+    let args = render::sanitize_terminal_text(&safe_args(&tool_call.function.arguments));
+    let name = render::sanitize_terminal_text(&tool_call.function.name);
+    let _ = print_flush(&format!("\n[tool {name} {args}]\n"));
+    report_log(
+        services.logger_state,
+        "tool event",
+        services
+            .logger
+            .record_event(LogicalEvent::Tool {
+                timestamp: timestamp(),
+                name: tool_call.function.name.clone(),
+                arguments: tool_call.function.arguments.clone(),
+                elapsed_ms: 0,
+                retry_count: retries as u32,
+                error: None,
+                result: None,
+            })
+            .await,
+    )
+    .await;
+}
+
+async fn handle_tool_result(
+    services: RuntimeServices<'_>,
+    tool_result: &rig_core::message::ToolResult,
+) {
+    let text = collect_tool_result(tool_result);
+    report_log(
+        services.logger_state,
+        "tool result",
+        services.logger.record_tool(timestamp(), text).await,
+    )
+    .await;
+    let _ = print_flush("[tool completed]\n");
+}
+
+async fn handle_completion_call(
+    services: RuntimeServices<'_>,
+    call: &rig_core::agent::CompletionCall,
+    retries: u8,
+) {
+    report_log(
+        services.logger_state,
+        "completion call",
+        services
+            .logger
+            .record_event(LogicalEvent::Tool {
+                timestamp: timestamp(),
+                name: "completion_call".into(),
+                arguments: serde_json::json!({
+                    "call_index": call.call_index,
+                    "usage": call.usage
+                }),
+                elapsed_ms: 0,
+                retry_count: retries as u32,
+                error: None,
+                result: None,
+            })
+            .await,
+    )
+    .await;
+}
+
+fn handle_assistant_text(text: &str, assistant_text: &mut String) {
+    assistant_text.push_str(text);
+    let safe = render::sanitize_terminal_text(text);
+    let _ = print_flush(&safe);
 }
 
 async fn turn(
@@ -351,32 +490,12 @@ async fn turn(
         let mut stream = loop {
             tokio::select! {
                 stream = &mut stream_build => break stream,
-                event = activities.recv() => match event {
-                    Ok(event) => {
-                        visible = true;
-                        let key = format!("{event:?}");
-                        *rendered_activities.entry(key).or_default() += 1;
-                        show_activity(services.logger, services.logger_state, event).await;
-                    }
-                    Err(broadcast::error::RecvError::Lagged(n)) => {
-                        visible = true;
-                        eprintln!("warning: missed {n} search activity events");
-                    }
-                    Err(_) => {}
-                },
-                event = memory_events.recv() => match event {
-                    Ok(event) => {
-                        visible = true;
-                        let key = format!("{event:?}");
-                        *rendered_memory_events.entry(key).or_default() += 1;
-                        show_memory_event(services.logger, services.logger_state, event).await;
-                    }
-                    Err(broadcast::error::RecvError::Lagged(n)) => {
-                        visible = true;
-                        eprintln!("warning: missed {n} memory events");
-                    }
-                    Err(_) => {}
-                },
+                event = activities.recv() => {
+                    visible |= on_activity_recv(event, services, &mut rendered_activities).await;
+                }
+                event = memory_events.recv() => {
+                    visible |= on_memory_recv(event, services, &mut rendered_memory_events).await;
+                }
             }
         };
         let mut final_response = None;
@@ -386,57 +505,43 @@ async fn turn(
             tokio::select! {
                 item = stream.next() => match item {
                     Some(Ok(MultiTurnStreamItem::StreamAssistantItem(item))) => match item {
-                        StreamedAssistantContent::Text(text) => { visible = true; assistant_text.push_str(&text.text); let safe = render::sanitize_terminal_text(&text.text); let _ = print_flush(&safe); }
-                        StreamedAssistantContent::ToolCall { .. } | StreamedAssistantContent::ToolCallDelta { .. } | StreamedAssistantContent::Reasoning(_) | StreamedAssistantContent::ReasoningDelta { .. } | StreamedAssistantContent::Unknown(_) => {}
+                        StreamedAssistantContent::Text(text) => {
+                            visible = true;
+                            handle_assistant_text(&text.text, &mut assistant_text);
+                        }
+                        StreamedAssistantContent::ToolCall { .. }
+                        | StreamedAssistantContent::ToolCallDelta { .. }
+                        | StreamedAssistantContent::Reasoning(_)
+                        | StreamedAssistantContent::ReasoningDelta { .. }
+                        | StreamedAssistantContent::Unknown(_) => {}
                         _ => {}
                     },
                     Some(Ok(MultiTurnStreamItem::ToolExecutionStart { tool_call, .. })) => {
                         visible = true;
-                        let args = render::sanitize_terminal_text(&safe_args(&tool_call.function.arguments));
-                        let name = render::sanitize_terminal_text(&tool_call.function.name);
-                        let _ = print_flush(&format!("\n[tool {name} {args}]\n"));
-                        report_log(services.logger_state, "tool event", services.logger.record_event(LogicalEvent::Tool { timestamp: timestamp(), name: tool_call.function.name, arguments: tool_call.function.arguments, elapsed_ms: 0, retry_count: retries as u32, error: None, result: None }).await).await;
+                        handle_tool_start(services, &tool_call, retries).await;
                     }
-                    Some(Ok(MultiTurnStreamItem::StreamUserItem(StreamedUserContent::ToolResult { tool_result, .. }))) => {
+                    Some(Ok(MultiTurnStreamItem::StreamUserItem(
+                        StreamedUserContent::ToolResult { tool_result, .. },
+                    ))) => {
                         visible = true;
-                        let text = collect_tool_result(&tool_result);
-                        report_log(services.logger_state, "tool result", services.logger.record_tool(timestamp(), text).await).await;
-                        let _ = print_flush("[tool completed]\n");
+                        handle_tool_result(services, &tool_result).await;
                     }
                     Some(Ok(MultiTurnStreamItem::CompletionCall(call))) => {
-                        report_log(services.logger_state, "completion call", services.logger.record_event(LogicalEvent::Tool { timestamp: timestamp(), name: "completion_call".into(), arguments: serde_json::json!({"call_index": call.call_index, "usage": call.usage}), elapsed_ms: 0, retry_count: retries as u32, error: None, result: None }).await).await;
+                        handle_completion_call(services, &call, retries).await;
                     }
-                    Some(Ok(MultiTurnStreamItem::FinalResponse(response))) => final_response = Some(response),
+                    Some(Ok(MultiTurnStreamItem::FinalResponse(response))) => {
+                        final_response = Some(response);
+                    }
                     Some(Err(error)) => failure = Some(error.to_string()),
                     None => failure = Some("stream ended without FinalResponse".into()),
                     _ => {}
                 },
-                event = activities.recv() => match event {
-                    Ok(event) => {
-                        visible = true;
-                        let key = format!("{event:?}");
-                        *rendered_activities.entry(key).or_default() += 1;
-                        show_activity(services.logger, services.logger_state, event).await;
-                    }
-                    Err(broadcast::error::RecvError::Lagged(n)) => {
-                        visible = true;
-                        eprintln!("warning: missed {n} search activity events");
-                    }
-                    Err(_) => {}
-                },
-                event = memory_events.recv() => match event {
-                    Ok(event) => {
-                        visible = true;
-                        let key = format!("{event:?}");
-                        *rendered_memory_events.entry(key).or_default() += 1;
-                        show_memory_event(services.logger, services.logger_state, event).await;
-                    }
-                    Err(broadcast::error::RecvError::Lagged(n)) => {
-                        visible = true;
-                        eprintln!("warning: missed {n} memory events");
-                    }
-                    Err(_) => {}
-                },
+                event = activities.recv() => {
+                    visible |= on_activity_recv(event, services, &mut rendered_activities).await;
+                }
+                event = memory_events.recv() => {
+                    visible |= on_memory_recv(event, services, &mut rendered_memory_events).await;
+                }
             }
         }
         visible |= drain_queued_events(

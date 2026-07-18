@@ -83,6 +83,7 @@ impl BackendRegistry {
             pools.insert_shared("arxiv", cfg.concurrency, cfg.min_interval_ms.max(3000));
         }
 
+        let cap = config.public.search.per_backend_hit_cap;
         let mut registry = Self::new();
         for (name, cfg) in &config.public.providers {
             if !cfg.enable {
@@ -99,173 +100,47 @@ impl BackendRegistry {
             } else {
                 http
             };
-            let backend = match name.as_str() {
-                "duckduckgo" => backends::duckduckgo::DuckDuckGoBackend::from_config(
-                    cfg,
-                    http,
-                    secret,
-                    config.public.search.per_backend_hit_cap,
-                )?,
-                "hn" => backends::hn::HnBackend::from_config(
-                    cfg,
-                    http,
-                    secret,
-                    config.public.search.per_backend_hit_cap,
-                )?,
-                "stract" => backends::stract::StractBackend::from_config(
-                    cfg,
-                    http,
-                    secret,
-                    config.public.search.per_backend_hit_cap,
-                )?,
-                "wiby" => backends::wiby::WibyBackend::from_config(
-                    cfg,
-                    http,
-                    secret,
-                    config.public.search.per_backend_hit_cap,
-                )?,
-                "mdn" => backends::mdn::MdnBackend::from_config(
-                    cfg,
-                    http,
-                    secret,
-                    config.public.search.per_backend_hit_cap,
-                )?,
-                "reddit" => backends::reddit::RedditBackend::from_config(
-                    cfg,
-                    http,
-                    secret,
-                    config.public.search.per_backend_hit_cap,
-                )?,
-                "lobsters" => backends::lobsters::LobstersBackend::from_config(
-                    cfg,
-                    http,
-                    secret,
-                    config.public.search.per_backend_hit_cap,
-                )?,
-                "searchmysite" => backends::searchmysite::SearchMySiteBackend::from_config(
-                    cfg,
-                    http,
-                    secret,
-                    config.public.search.per_backend_hit_cap,
-                )?,
-                "marginalia" => backends::marginalia::MarginaliaBackend::from_config(
-                    cfg,
-                    http,
-                    secret,
-                    config.public.search.per_backend_hit_cap,
-                )?,
-                "mwmbl" => backends::mwmbl::MwmblBackend::from_config(
-                    cfg,
-                    http,
-                    secret,
-                    config.public.search.per_backend_hit_cap,
-                )?,
-                "wikipedia" => backends::wikipedia::WikipediaBackend::from_config(
-                    cfg,
-                    http,
-                    secret,
-                    config.public.search.per_backend_hit_cap,
-                )?,
-                "wikidata" => backends::wikidata::WikidataBackend::from_config(
-                    cfg,
-                    http,
-                    secret,
-                    config.public.search.per_backend_hit_cap,
-                )?,
-                "openlibrary" => backends::openlibrary::OpenLibraryBackend::from_config(
-                    cfg,
-                    http,
-                    secret,
-                    config.public.search.per_backend_hit_cap,
-                )?,
-                "free_dictionary" => backends::freedictionary::FreeDictionaryBackend::from_config(
-                    cfg,
-                    http,
-                    secret,
-                    config.public.search.per_backend_hit_cap,
-                )?,
-                "arxiv" => backends::arxiv::ArxivBackend::from_config(
-                    cfg,
-                    http,
-                    secret,
-                    config.public.search.per_backend_hit_cap,
-                )?,
-                "crossref" => backends::crossref::CrossrefBackend::from_config(
-                    cfg,
-                    http,
-                    secret,
-                    config.public.search.per_backend_hit_cap,
-                )?,
-                "semantic_scholar" => {
-                    backends::semantic_scholar::SemanticScholarBackend::from_config(
-                        cfg,
-                        http,
-                        secret,
-                        config.public.search.per_backend_hit_cap,
-                    )?
-                }
-                "pubmed" => backends::pubmed::PubmedBackend::from_config(
-                    cfg,
-                    http,
-                    secret,
-                    config.public.search.per_backend_hit_cap,
-                )?,
-                "github" => backends::github::GithubBackend::from_config(
-                    cfg,
-                    http,
-                    secret,
-                    config.public.search.per_backend_hit_cap,
-                )?,
-                "stackexchange" => backends::stackexchange::StackexchangeBackend::from_config(
-                    cfg,
-                    http,
-                    secret,
-                    config.public.search.per_backend_hit_cap,
-                )?,
-                "npm" => backends::npm::NpmBackend::from_config(
-                    cfg,
-                    http,
-                    secret,
-                    config.public.search.per_backend_hit_cap,
-                )?,
-                "crates_io" => backends::crates_io::CratesIoBackend::from_config(
-                    cfg,
-                    http,
-                    secret,
-                    config.public.search.per_backend_hit_cap,
-                )?,
-                "gdelt" => backends::gdelt::GdeltBackend::from_config(
-                    cfg,
-                    http,
-                    secret,
-                    config.public.search.per_backend_hit_cap,
-                )?,
-                "firecrawl" => backends::firecrawl::FirecrawlBackend::from_config(
-                    cfg,
-                    http,
-                    secret,
-                    config.public.search.per_backend_hit_cap,
-                )?,
-                "brave" => backends::brave::BraveBackend::from_config(
-                    cfg,
-                    http,
-                    secret,
-                    config.public.search.per_backend_hit_cap,
-                )?,
-                "mojeek" => backends::mojeek::MojeekBackend::from_config(
-                    cfg,
-                    http,
-                    secret,
-                    config.public.search.per_backend_hit_cap,
-                )?,
-                "searxng" => backends::searxng::SearxngBackend::from_config(
-                    cfg,
-                    http,
-                    secret,
-                    config.public.search.per_backend_hit_cap,
-                )?,
+
+            // All adapters share the same from_config signature; pick the constructor
+            // via one match and call it once — keeps per-backend policy in adapters.
+            type Ctor = fn(
+                &crate::config::ProviderConfig,
+                BackendHttp,
+                Option<&crate::config::ProviderSecret>,
+                usize,
+            ) -> Result<Option<Arc<dyn SearchBackend>>, AppError>;
+
+            let ctor: Ctor = match name.as_str() {
+                "duckduckgo" => backends::duckduckgo::DuckDuckGoBackend::from_config,
+                "hn" => backends::hn::HnBackend::from_config,
+                "stract" => backends::stract::StractBackend::from_config,
+                "wiby" => backends::wiby::WibyBackend::from_config,
+                "mdn" => backends::mdn::MdnBackend::from_config,
+                "reddit" => backends::reddit::RedditBackend::from_config,
+                "lobsters" => backends::lobsters::LobstersBackend::from_config,
+                "searchmysite" => backends::searchmysite::SearchMySiteBackend::from_config,
+                "marginalia" => backends::marginalia::MarginaliaBackend::from_config,
+                "mwmbl" => backends::mwmbl::MwmblBackend::from_config,
+                "wikipedia" => backends::wikipedia::WikipediaBackend::from_config,
+                "wikidata" => backends::wikidata::WikidataBackend::from_config,
+                "openlibrary" => backends::openlibrary::OpenLibraryBackend::from_config,
+                "free_dictionary" => backends::freedictionary::FreeDictionaryBackend::from_config,
+                "arxiv" => backends::arxiv::ArxivBackend::from_config,
+                "crossref" => backends::crossref::CrossrefBackend::from_config,
+                "semantic_scholar" => backends::semantic_scholar::SemanticScholarBackend::from_config,
+                "pubmed" => backends::pubmed::PubmedBackend::from_config,
+                "github" => backends::github::GithubBackend::from_config,
+                "stackexchange" => backends::stackexchange::StackexchangeBackend::from_config,
+                "npm" => backends::npm::NpmBackend::from_config,
+                "crates_io" => backends::crates_io::CratesIoBackend::from_config,
+                "gdelt" => backends::gdelt::GdeltBackend::from_config,
+                "firecrawl" => backends::firecrawl::FirecrawlBackend::from_config,
+                "brave" => backends::brave::BraveBackend::from_config,
+                "mojeek" => backends::mojeek::MojeekBackend::from_config,
+                "searxng" => backends::searxng::SearxngBackend::from_config,
                 _ => unreachable!("validated provider name"),
             };
+            let backend = ctor(cfg, http, secret, cap)?;
             if let Some(backend) = backend {
                 registry.add(backend);
             }
