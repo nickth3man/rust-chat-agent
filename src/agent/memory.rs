@@ -58,6 +58,18 @@ impl Activity {
         }
         let _ = self.tx.send(event); // no receiver is a normal operating state
     }
+    fn emit_kind(
+        &self,
+        kind: MemoryEventKind,
+        conversation_id: impl Into<String>,
+        detail: impl Into<String>,
+    ) {
+        self.emit(MemoryEvent {
+            kind,
+            conversation_id: conversation_id.into(),
+            detail: detail.into(),
+        });
+    }
 }
 
 /// Replace large web-tool payloads at the append seam, while retaining the
@@ -80,31 +92,42 @@ pub fn sanitize_messages(messages: Vec<Message>) -> Vec<Message> {
                     .iter()
                     .any(|c| matches!(c, UserContent::ToolResult(_))) =>
             {
-                let mut kept = Vec::new();
-                for item in content.iter() {
-                    match item {
-                        UserContent::ToolResult(result) => {
-                            let tool_name = pending_calls.remove(&result.id);
-                            if tool_name.as_deref().is_some_and(is_web_tool) {
-                                kept.push(UserContent::ToolResult(compact_tool_result(result)));
-                            } else {
-                                // Non-web tools are deliberately lossless.
-                                kept.push(item.clone());
-                            }
-                        }
-                        other => kept.push(other.clone()),
-                    }
-                }
-                if !kept.is_empty() {
-                    out.push(Message::User {
-                        content: OneOrMany::many(kept).expect("non-empty"),
-                    });
+                if let Some(msg) = rewrite_tool_result_user(content, &mut pending_calls) {
+                    out.push(msg);
                 }
             }
             _ => out.push(message),
         }
     }
     out
+}
+
+fn rewrite_tool_result_user(
+    content: &OneOrMany<UserContent>,
+    pending_calls: &mut HashMap<String, String>,
+) -> Option<Message> {
+    let mut kept = Vec::new();
+    for item in content.iter() {
+        match item {
+            UserContent::ToolResult(result) => {
+                let tool_name = pending_calls.remove(&result.id);
+                if tool_name.as_deref().is_some_and(is_web_tool) {
+                    kept.push(UserContent::ToolResult(compact_tool_result(result)));
+                } else {
+                    // Non-web tools are deliberately lossless.
+                    kept.push(item.clone());
+                }
+            }
+            other => kept.push(other.clone()),
+        }
+    }
+    if !kept.is_empty() {
+        Some(Message::User {
+            content: OneOrMany::many(kept).expect("non-empty"),
+        })
+    } else {
+        None
+    }
 }
 
 fn compact_tool_result(result: &rig_core::message::ToolResult) -> rig_core::message::ToolResult {
@@ -133,27 +156,7 @@ fn compact_web_json(value: &serde_json::Value) -> String {
             .cloned()
             .unwrap_or_default();
         for hit in selected {
-            let title = hit.get("title").and_then(|v| v.as_str()).unwrap_or("");
-            let url = hit.get("url").and_then(|v| v.as_str()).unwrap_or("");
-            let snippet = hit.get("snippet").and_then(|v| v.as_str()).unwrap_or("");
-            let providers = hit.get("providers").map(compact_value).unwrap_or_default();
-            let normalized_url = normalize_url(url);
-            let decision = ranked.iter().find(|entry| {
-                entry.get("normalized_url").and_then(|v| v.as_str())
-                    == Some(normalized_url.as_str())
-            });
-            let decision = decision
-                .and_then(|entry| entry.get("decision"))
-                .map(compact_value)
-                .unwrap_or_else(|| "unknown".into());
-            lines.push(format!(
-                "title={} url={} snippet={} provider={} rank_decision={}",
-                truncate(title, 160),
-                truncate(url, 300),
-                truncate(snippet, 400),
-                truncate(&providers, 160),
-                truncate(&decision, 120)
-            ));
+            lines.push(format_selected_hit(hit, &ranked));
         }
     } else if value.get("content").is_some() || value.get("url").is_some() {
         let url = value.get("url").and_then(|v| v.as_str()).unwrap_or("");
@@ -178,6 +181,29 @@ fn compact_value(value: &serde_json::Value) -> String {
         .unwrap_or_else(|| value.to_string())
 }
 
+fn format_selected_hit(hit: &serde_json::Value, ranked: &[serde_json::Value]) -> String {
+    let title = hit.get("title").and_then(|v| v.as_str()).unwrap_or("");
+    let url = hit.get("url").and_then(|v| v.as_str()).unwrap_or("");
+    let snippet = hit.get("snippet").and_then(|v| v.as_str()).unwrap_or("");
+    let providers = hit.get("providers").map(compact_value).unwrap_or_default();
+    let normalized_url = normalize_url(url);
+    let decision = ranked.iter().find(|entry| {
+        entry.get("normalized_url").and_then(|v| v.as_str()) == Some(normalized_url.as_str())
+    });
+    let decision = decision
+        .and_then(|entry| entry.get("decision"))
+        .map(compact_value)
+        .unwrap_or_else(|| "unknown".into());
+    format!(
+        "title={} url={} snippet={} provider={} rank_decision={}",
+        truncate(title, 160),
+        truncate(url, 300),
+        truncate(snippet, 400),
+        truncate(&providers, 160),
+        truncate(&decision, 120)
+    )
+}
+
 fn strip_markup(value: &str) -> String {
     value
         .replace("<web_content", "")
@@ -199,6 +225,13 @@ fn short_excerpt(value: &str) -> String {
 
 fn is_web_tool(name: &str) -> bool {
     matches!(name, "meta_search" | "fetch_page")
+}
+
+fn is_tool_result_user(message: &Message) -> bool {
+    matches!(
+        message,
+        Message::User { content } if matches!(content.first_ref(), UserContent::ToolResult(_))
+    )
 }
 
 fn truncate(text: &str, max: usize) -> String {
@@ -227,8 +260,7 @@ impl MemoryPolicy for PressurePolicy {
         let split = messages.len() - 1;
         let mut demoted = messages[..split].to_vec();
         let mut kept = messages[split..].to_vec();
-        if matches!(kept.first(), Some(Message::User { content }) if matches!(content.first_ref(), UserContent::ToolResult(_)))
-        {
+        if kept.first().is_some_and(is_tool_result_user) {
             demoted.append(&mut kept);
         }
         Ok((kept, demoted))
@@ -259,11 +291,11 @@ impl Compactor for LlmCompactor {
         carry_over: Option<&'a Message>,
     ) -> WasmBoxedFuture<'a, Result<Message, MemoryError>> {
         Box::pin(async move {
-            self.activity.emit(MemoryEvent {
-                kind: MemoryEventKind::Started,
-                conversation_id: conversation_id.into(),
-                detail: format!("{} messages", evicted.len()),
-            });
+            self.activity.emit_kind(
+                MemoryEventKind::Started,
+                conversation_id,
+                format!("{} messages", evicted.len()),
+            );
             let mut input = Vec::with_capacity(evicted.len() + usize::from(carry_over.is_some()));
             if let Some(previous) = carry_over {
                 input.push(previous.clone());
@@ -271,42 +303,42 @@ impl Compactor for LlmCompactor {
             input.extend_from_slice(evicted);
             match self.summarizer.summarize(conversation_id, &input).await {
                 Ok(text) => {
-                    self.activity.emit(MemoryEvent {
-                        kind: MemoryEventKind::Completed,
-                        conversation_id: conversation_id.into(),
-                        detail: "summary created".into(),
-                    });
-                    Ok(Message::System { content: text })
+                    self.activity.emit_kind(
+                        MemoryEventKind::Completed,
+                        conversation_id,
+                        "summary created",
+                    );
+                    return Ok(Message::System { content: text });
                 }
                 Err(first) => {
-                    self.activity.emit(MemoryEvent {
-                        kind: MemoryEventKind::Retry,
-                        conversation_id: conversation_id.into(),
-                        detail: first.to_string(),
-                    });
-                    match self.summarizer.summarize(conversation_id, &input).await {
-                        Ok(text) => {
-                            self.activity.emit(MemoryEvent {
-                                kind: MemoryEventKind::Completed,
-                                conversation_id: conversation_id.into(),
-                                detail: "summary retry succeeded".into(),
-                            });
-                            Ok(Message::System { content: text })
-                        }
-                        Err(second) => {
-                            self.activity.emit(MemoryEvent {
-                                kind: MemoryEventKind::Fallback,
-                                conversation_id: conversation_id.into(),
-                                detail: second.to_string(),
-                            });
-                            Ok(Message::System {
-                                content: format!(
-                                    "Earlier context was compacted safely; {} messages omitted.",
-                                    evicted.len()
-                                ),
-                            })
-                        }
-                    }
+                    self.activity.emit_kind(
+                        MemoryEventKind::Retry,
+                        conversation_id,
+                        first.to_string(),
+                    );
+                }
+            }
+            match self.summarizer.summarize(conversation_id, &input).await {
+                Ok(text) => {
+                    self.activity.emit_kind(
+                        MemoryEventKind::Completed,
+                        conversation_id,
+                        "summary retry succeeded",
+                    );
+                    Ok(Message::System { content: text })
+                }
+                Err(second) => {
+                    self.activity.emit_kind(
+                        MemoryEventKind::Fallback,
+                        conversation_id,
+                        second.to_string(),
+                    );
+                    Ok(Message::System {
+                        content: format!(
+                            "Earlier context was compacted safely; {} messages omitted.",
+                            evicted.len()
+                        ),
+                    })
                 }
             }
         })
@@ -335,13 +367,10 @@ impl ProductionMemory {
         summarizer: Arc<dyn Summarizer>,
     ) -> Self {
         let force = Arc::new(AtomicBool::new(false));
-        let counter = if model_id.to_ascii_lowercase().contains("claude")
-            || model_id.to_ascii_lowercase().contains("anthropic")
-        {
+        let model = model_id.to_ascii_lowercase();
+        let counter = if model.contains("claude") || model.contains("anthropic") {
             HeuristicTokenCounter::anthropic()
-        } else if model_id.to_ascii_lowercase().contains("gemini")
-            || model_id.to_ascii_lowercase().contains("google")
-        {
+        } else if model.contains("gemini") || model.contains("google") {
             HeuristicTokenCounter::gemini()
         } else {
             HeuristicTokenCounter::default()
@@ -394,11 +423,8 @@ impl ConversationMemory for ProductionMemory {
         self.force.store(false, Ordering::Release);
         Box::pin(async move {
             self.inner.clear(id).await?;
-            self.activity.emit(MemoryEvent {
-                kind: MemoryEventKind::Cleared,
-                conversation_id: id.into(),
-                detail: "conversation cleared".into(),
-            });
+            self.activity
+                .emit_kind(MemoryEventKind::Cleared, id, "conversation cleared");
             Ok(())
         })
     }
