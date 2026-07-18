@@ -5,8 +5,13 @@
 .env
 .env.*
 !.env.example
+/config.toml
+/sessions/
 
 # IDE / editor
 .idea/
 .vscode/
 *.swp
+
+# Local deepwork progress state
+.slim/deepwork/
