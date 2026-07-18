@@ -127,7 +127,9 @@ impl BackendRegistry {
                 "free_dictionary" => backends::freedictionary::FreeDictionaryBackend::from_config,
                 "arxiv" => backends::arxiv::ArxivBackend::from_config,
                 "crossref" => backends::crossref::CrossrefBackend::from_config,
-                "semantic_scholar" => backends::semantic_scholar::SemanticScholarBackend::from_config,
+                "semantic_scholar" => {
+                    backends::semantic_scholar::SemanticScholarBackend::from_config
+                }
                 "pubmed" => backends::pubmed::PubmedBackend::from_config,
                 "github" => backends::github::GithubBackend::from_config,
                 "stackexchange" => backends::stackexchange::StackexchangeBackend::from_config,
