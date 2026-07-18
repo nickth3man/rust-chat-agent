@@ -828,4 +828,85 @@ mod tests {
         assert!(!value.contains("another-secret"));
         assert!(value.contains(r#""api_key":"[REDACTED]""#));
     }
+
+    // --- Characterization tests pinning `turn()` retry / visibility / dedup
+    // behavior. These exercise the pure decision helpers that `turn()`
+    // delegates to; the behavior must remain identical through the upcoming
+    // simplification. ---
+
+    #[test]
+    fn transient_error_classifies_status_codes_and_keywords() {
+        // Transient HTTP status codes.
+        for code in [408, 429, 500, 501, 502, 503, 504, 599] {
+            assert!(
+                transient_error(&format!("upstream error {code} occurred")),
+                "{code} should be transient"
+            );
+        }
+        // Non-transient status codes.
+        for code in [200, 301, 400, 401, 403, 404, 410, 422] {
+            assert!(
+                !transient_error(&format!("upstream error {code} occurred")),
+                "{code} should NOT be transient"
+            );
+        }
+        // Keyword-based classification (case-insensitive).
+        for needle in [
+            "request Timeout waiting",
+            "the call Timed Out",
+            "a Network failure",
+            "Connection reset",
+        ] {
+            assert!(transient_error(needle), "{needle:?} should be transient");
+        }
+        // Ordinary text is not transient.
+        assert!(!transient_error("model produced an invalid tool call"));
+        assert!(!transient_error(""));
+    }
+
+    #[test]
+    fn transient_error_status_codes_require_digit_boundaries() {
+        // A code run-on into alphanumerics is NOT a status code.
+        assert!(!transient_error("error code is 503abc"));
+        assert!(!transient_error("error code is abc503"));
+        // A code glued to a preceding digit is not a standalone status code.
+        assert!(!transient_error("reference 14080 happened"));
+    }
+
+    #[test]
+    fn may_retry_only_when_invisible_first_attempt_and_transient() {
+        // Happy path: invisible, first attempt, transient -> retry.
+        assert!(may_retry("upstream 503", false, 0));
+        assert!(may_retry("Connection dropped", false, 0));
+        // Visibility suppresses retry, even if transient.
+        assert!(!may_retry("upstream 503", true, 0));
+        // Already retried once -> never retry again (max 1 attempt total).
+        assert!(!may_retry("upstream 503", false, 1));
+        assert!(!may_retry("upstream 503", false, 5));
+        // Non-transient error never retries.
+        assert!(!may_retry("tool call malformed", false, 0));
+        assert!(!may_retry("404 not found", false, 0));
+    }
+
+    #[test]
+    fn dedup_helpers_track_rendered_event_counts() {
+        let mut rendered = HashMap::<String, usize>::new();
+        let event = ("search", 7u32);
+        // Not seen yet.
+        assert!(!consume_rendered(&mut rendered, &event));
+        // Note twice -> count is 2.
+        note_rendered(&mut rendered, &event);
+        note_rendered(&mut rendered, &event);
+        // First consume drops one count but the entry remains "seen".
+        assert!(consume_rendered(&mut rendered, &event));
+        // Second consume fully drains the entry.
+        assert!(consume_rendered(&mut rendered, &event));
+        // Now it is genuinely absent again.
+        assert!(!consume_rendered(&mut rendered, &event));
+        // Distinct events are tracked independently.
+        let other = ("search", 8u32);
+        note_rendered(&mut rendered, &other);
+        assert!(consume_rendered(&mut rendered, &other));
+        assert!(!consume_rendered(&mut rendered, &other));
+    }
 }
