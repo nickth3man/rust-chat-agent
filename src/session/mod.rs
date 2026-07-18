@@ -77,9 +77,6 @@ impl SessionLogger {
     pub fn path(&self) -> &Path {
         self.path.as_path()
     }
-    pub fn log_path(&self) -> &Path {
-        self.path()
-    }
 
     pub async fn snapshot(&self) -> SessionDocument {
         self.document.lock().await.clone()
@@ -88,9 +85,6 @@ impl SessionLogger {
     pub async fn record_transcript(&self, mut entry: TranscriptEntry) -> Result<(), AppError> {
         entry.content = self.scrub(&entry.content);
         self.mutate(|doc| doc.transcript.push(entry)).await
-    }
-    pub async fn record_transcript_entry(&self, entry: TranscriptEntry) -> Result<(), AppError> {
-        self.record_transcript(entry).await
     }
     pub async fn record_user(&self, timestamp: String, content: String) -> Result<(), AppError> {
         self.record_transcript(TranscriptEntry {
@@ -129,9 +123,6 @@ impl SessionLogger {
             .map_err(|_| AppError::SessionLog("sanitize event failed".into()))?;
         self.mutate(|doc| doc.events.push(event)).await
     }
-    pub async fn record_logical_event(&self, event: LogicalEvent) -> Result<(), AppError> {
-        self.record_event(event).await
-    }
     pub async fn record_provenance(&self, provenance: TurnProvenance) -> Result<(), AppError> {
         let value = self.scrub_value(
             serde_json::to_value(provenance)
@@ -140,9 +131,6 @@ impl SessionLogger {
         let provenance = serde_json::from_value(value)
             .map_err(|_| AppError::SessionLog("sanitize provenance failed".into()))?;
         self.mutate(|doc| doc.provenance.push(provenance)).await
-    }
-    pub async fn record_turn_provenance(&self, provenance: TurnProvenance) -> Result<(), AppError> {
-        self.record_provenance(provenance).await
     }
 
     pub async fn record_search_activity(&self, activity: SearchActivity) -> Result<(), AppError> {
@@ -256,9 +244,6 @@ impl SessionLogger {
                 .await
             }
         }
-    }
-    pub async fn record_activity(&self, activity: SearchActivity) -> Result<(), AppError> {
-        self.record_search_activity(activity).await
     }
 
     async fn mutate<F>(&self, update: F) -> Result<(), AppError>
@@ -883,5 +868,122 @@ mod tests {
         let before = std::fs::read(&path).unwrap();
         assert!(atomic_write_inner(&path, br#"{"new":true}"#, true).is_err());
         assert_eq!(std::fs::read(&path).unwrap(), before);
+    }
+
+    // --- Characterization tests pinning scrub_text secret-redaction
+    // invariants before any simplification. Each assertion locks a concrete
+    // observable rule; behavior must remain identical through refactoring. ---
+
+    #[test]
+    fn scrub_text_pins_per_key_value_redaction() {
+        // Each sensitive key form, in `key=value` shape, redacts its value.
+        // (Value token is chosen to not collide with any key name or marker.)
+        let value = "leakmark-77";
+        for key in [
+            "api_key",
+            "apikey",
+            "api-key",
+            "access_token",
+            "refresh_token",
+            "client_secret",
+            "password",
+            "passwd",
+            "credential",
+            "credentials",
+            "secret",
+            "token",
+            "authorization",
+            "private_key",
+            "encryption_key",
+        ] {
+            let input = format!("{key}={value}");
+            let out = scrub_text(&input, &[]);
+            assert!(!out.contains(value), "value leaked for key {key:?}: {out}");
+            assert!(
+                out.contains("[REDACTED]"),
+                "no redaction marker for key {key:?}: {out}"
+            );
+        }
+    }
+
+    #[test]
+    fn scrub_text_pins_quote_and_delimiter_forms() {
+        // Quoted JSON form.
+        assert!(scrub_text(r#"{"api_key":"sek"}"#, &[]).contains(r#""api_key":"[REDACTED]""#));
+        // Single-quote key with '=' delimiter.
+        assert!(scrub_text(r#"'api_key'='sek'"#, &[]).contains("[REDACTED]"));
+        // Colon delimiter with surrounding whitespace.
+        assert!(scrub_text("password : sek", &[]).contains("[REDACTED]"));
+        // Whitespace, '&', ',', newline all terminate an unquoted value.
+        for sep in ["&", ",", "\n"] {
+            let input = format!("token=sek{sep}more");
+            let out = scrub_text(&input, &[]);
+            assert!(!out.contains("sek"), "value leaked past {sep:?}: {out}");
+            assert!(
+                out.contains("more"),
+                "trailing content dropped past {sep:?}: {out}"
+            );
+        }
+    }
+
+    #[test]
+    fn scrub_text_pins_boundary_and_case_invariants() {
+        // Key glued to alphanumerics on either side is NOT a sensitive key.
+        let out = scrub_text("myapi_key sek and api_keyed sek2", &[]);
+        assert!(
+            out.contains("myapi_key"),
+            "prefixed key should be left intact: {out}"
+        );
+        assert!(
+            out.contains("api_keyed"),
+            "suffixed key should be left intact: {out}"
+        );
+        // Keys are matched case-insensitively.
+        let mixed = scrub_text("API-KEY=sek TOKEN=sek2", &[]);
+        assert!(
+            !mixed.contains("sek") && !mixed.contains("sek2"),
+            "case-insensitive match failed: {mixed}"
+        );
+        // The standalone word "tokenization"/"credentials-report" behavior:
+        // "tokenization" must NOT be redacted as a "token" key (suffix boundary).
+        let word = scrub_text("tokenization rules", &[]);
+        assert!(
+            word.contains("tokenization"),
+            "ordinary word clobbered: {word}"
+        );
+    }
+
+    #[test]
+    fn scrub_text_pins_bearer_and_empty_secret_invariants() {
+        // Bare Bearer scheme with no JSON/header key still redacts the credential.
+        let bearer = scrub_text("Authorization: Bearer abc123def", &[]);
+        assert!(
+            !bearer.contains("abc123def"),
+            "bearer credential leaked: {bearer}"
+        );
+        // Standalone bearer (no preceding key).
+        let standalone = scrub_text("bearer tok-456", &[]);
+        assert!(
+            !standalone.contains("tok-456"),
+            "standalone bearer leaked: {standalone}"
+        );
+        // Empty configured secrets are skipped entirely: they must NOT cause a
+        // replace-all that inserts [REDACTED] between every character, and plain
+        // text with no sensitive key is left byte-for-byte intact.
+        let plain = scrub_text("plain text here", &["".to_string()]);
+        assert_eq!(
+            plain, "plain text here",
+            "empty secret should be a no-op: {plain}"
+        );
+        // Key-based redaction still applies even when an empty secret is present.
+        let with_key = scrub_text("api_key=sek", &["".to_string()]);
+        assert!(
+            !with_key.contains("sek"),
+            "key redaction skipped: {with_key}"
+        );
+        assert!(
+            with_key.contains("[REDACTED]"),
+            "no redaction marker: {with_key}"
+        );
     }
 }

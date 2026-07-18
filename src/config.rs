@@ -6,32 +6,23 @@ use std::collections::BTreeMap;
 use std::fs;
 use std::path::{Path, PathBuf};
 
-fn default_model() -> String {
-    "openrouter/auto".into()
-}
-fn default_true() -> bool {
-    true
-}
-fn default_provider_timeout() -> u64 {
-    6
-}
-fn default_stage_budget() -> u64 {
-    20
-}
-fn default_rank_timeout() -> u64 {
-    20
-}
-fn default_hit_cap() -> usize {
-    5
-}
-fn default_output_bytes() -> usize {
-    6144
-}
-fn default_concurrency() -> usize {
-    1
-}
+fn default_model() -> String { "openrouter/auto".into() }
+fn default_true() -> bool { true }
+fn default_provider_timeout() -> u64 { 6 }
+fn default_stage_budget() -> u64 { 20 }
+fn default_rank_timeout() -> u64 { 20 }
+fn default_hit_cap() -> usize { 5 }
+fn default_output_bytes() -> usize { 6144 }
+fn default_concurrency() -> usize { 1 }
 fn default_user_agent() -> String {
     "openrouter-chat-rust/0.1 (+https://github.com/nickth3man/rust-chat-agent)".into()
+}
+
+/// Treat an environment-variable name as absent when it is missing or blank,
+/// matching the original `as_deref().filter(|s| !s.trim().is_empty())` shape
+/// used for every provider credential / endpoint lookup.
+fn non_empty(name: &Option<String>) -> Option<&str> {
+    name.as_deref().filter(|value| !value.trim().is_empty())
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -179,13 +170,12 @@ pub fn resolve_inputs(
             .api_key_env
             .as_deref()
             .filter(|key| !key.trim().is_empty())
+            && api_key.as_deref().is_none_or(|key| key.trim().is_empty())
         {
-            if api_key.as_deref().is_none_or(|key| key.trim().is_empty()) {
-                return Err(AppError::MissingCredential {
-                    provider: name.clone(),
-                    env_var: env_var.to_owned(),
-                });
-            }
+            return Err(AppError::MissingCredential {
+                provider: name.clone(),
+                env_var: env_var.to_owned(),
+            });
         }
         let optional_api_key = provider
             .optional_api_key_env

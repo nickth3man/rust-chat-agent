@@ -609,21 +609,12 @@ fn cap_output(
     mut output: MetaSearchOutput,
     cap: usize,
 ) -> Result<MetaSearchOutput, MetaSearchError> {
-    while serde_json::to_vec(&output)
-        .map_err(|e| MetaSearchError::Output(e.to_string()))?
-        .len()
-        > cap
-        && output.selected.len() > 1
-    {
+    while serialized_len(&output)? > cap && output.selected.len() > 1 {
         output.selected.pop();
         output.ranked_evidence.pop();
     }
     truncate_output(&mut output, cap)?;
-    if serde_json::to_vec(&output)
-        .map_err(|e| MetaSearchError::Output(e.to_string()))?
-        .len()
-        > cap
-    {
+    if serialized_len(&output)? > cap {
         output.selected.clear();
         output.ranked_evidence.clear();
         output.warnings.clear();
@@ -633,64 +624,56 @@ fn cap_output(
     Ok(output)
 }
 
+fn serialized_len(output: &MetaSearchOutput) -> Result<usize, MetaSearchError> {
+    serde_json::to_vec(output)
+        .map(|v| v.len())
+        .map_err(|e| MetaSearchError::Output(e.to_string()))
+}
+
+/// Byte length of the serialized output, checked repeatedly by the truncation
+/// loop. Extracted so every site shares one error-mapping path.
 fn truncate_output(output: &mut MetaSearchOutput, cap: usize) -> Result<(), MetaSearchError> {
     loop {
-        let size = serde_json::to_vec(output)
-            .map_err(|e| MetaSearchError::Output(e.to_string()))?
-            .len();
-        if size <= cap {
+        if serialized_len(output)? <= cap {
             return Ok(());
         }
-        let mut changed = false;
-        for value in [&mut output.query]
-            .into_iter()
-            .chain(output.warnings.iter_mut())
-        {
-            if value.chars().count() > 8 {
-                let n = value.chars().count() - 1;
-                *value = value.chars().take(n).collect();
-                changed = true;
-                break;
-            }
-        }
-        if !changed {
-            for hit in &mut output.selected {
-                for value in [&mut hit.title, &mut hit.url, &mut hit.snippet]
+        // Short-circuit `||` mirrors the original three-block order: query +
+        // warnings first, then each selected hit's fields, then ranked evidence.
+        let changed = shrink_one(
+            [&mut output.query]
+                .into_iter()
+                .chain(output.warnings.iter_mut()),
+        ) || output.selected.iter_mut().any(|hit| {
+            shrink_one(
+                [&mut hit.title, &mut hit.url, &mut hit.snippet]
                     .into_iter()
                     .chain(hit.providers.iter_mut())
-                    .chain(hit.source_subtypes.iter_mut())
-                {
-                    if value.chars().count() > 8 {
-                        *value = value.chars().take(value.chars().count() - 1).collect();
-                        changed = true;
-                        break;
-                    }
-                }
-                if changed {
-                    break;
-                }
-            }
-        }
-        if !changed {
-            for evidence in &mut output.ranked_evidence {
-                for value in [&mut evidence.normalized_url, &mut evidence.decision] {
-                    if value.chars().count() > 8 {
-                        *value = value.chars().take(value.chars().count() - 1).collect();
-                        changed = true;
-                        break;
-                    }
-                }
-                if changed {
-                    break;
-                }
-            }
-        }
+                    .chain(hit.source_subtypes.iter_mut()),
+            )
+        }) || output
+            .ranked_evidence
+            .iter_mut()
+            .any(|evidence| shrink_one([&mut evidence.normalized_url, &mut evidence.decision]));
         if !changed {
             return Err(MetaSearchError::Output(format!(
                 "configured output cap {cap} is too small"
             )));
         }
     }
+}
+
+/// Drop exactly one trailing character from the first string in `values` that is
+/// longer than eight characters; returns true if a string was shortened. This
+/// preserves the original "first eligible field, one char at a time" policy.
+fn shrink_one<'a>(values: impl IntoIterator<Item = &'a mut String>) -> bool {
+    for value in values {
+        let len = value.chars().count();
+        if len > 8 {
+            *value = value.chars().take(len - 1).collect();
+            return true;
+        }
+    }
+    false
 }
 
 #[cfg(test)]

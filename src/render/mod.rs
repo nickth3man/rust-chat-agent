@@ -13,6 +13,36 @@ use std::collections::HashSet;
 use std::io::{self, Write};
 use std::path::Path;
 
+/// Consume the remainder of an ANSI escape sequence from `chars`, which must
+/// be positioned just after the leading ESC (`\u{1b}`) was read. Shared by both
+/// terminal sanitizers so the OSC / CSI / two-byte handling cannot drift apart.
+fn skip_ansi_sequence(chars: &mut std::iter::Peekable<std::str::Chars>) {
+    match chars.next() {
+        Some(']') => {
+            // OSC sequences end at BEL or the ST sequence (ESC \\).
+            while let Some(next) = chars.next() {
+                if next == '\u{7}' {
+                    break;
+                }
+                if next == '\u{1b}' && chars.next_if_eq(&'\\').is_some() {
+                    break;
+                }
+            }
+        }
+        Some('[') => {
+            // CSI sequences end with a byte in the final range.
+            for next in chars.by_ref() {
+                if ('@'..='~').contains(&next) {
+                    break;
+                }
+            }
+        }
+        Some(_) | None => {
+            // Consume the command character of a two-byte ESC form.
+        }
+    }
+}
+
 /// Make untrusted text safe to place in a terminal-rendered line.
 ///
 /// CR/LF are deliberately represented as spaces: allowing either one through
@@ -24,36 +54,11 @@ fn sanitize_terminal_line(input: &str) -> String {
     let mut output = String::with_capacity(input.len());
     let mut chars = input.chars().peekable();
     let mut pending_line_break = false;
-
     while let Some(character) = chars.next() {
         if character == '\u{1b}' {
-            match chars.next() {
-                Some(']') => {
-                    // OSC sequences end at BEL or the ST sequence (ESC \\).
-                    while let Some(next) = chars.next() {
-                        if next == '\u{7}' {
-                            break;
-                        }
-                        if next == '\u{1b}' && chars.next_if_eq(&'\\').is_some() {
-                            break;
-                        }
-                    }
-                }
-                Some('[') => {
-                    // CSI sequences end with a byte in the final range.
-                    for next in chars.by_ref() {
-                        if ('@'..='~').contains(&next) {
-                            break;
-                        }
-                    }
-                }
-                Some(_) | None => {
-                    // Consume the command character of a two-byte ESC form.
-                }
-            }
+            skip_ansi_sequence(&mut chars);
             continue;
         }
-
         if character == '\r' || character == '\n' {
             pending_line_break = true;
             continue;
@@ -81,29 +86,9 @@ fn sanitize_terminal_line(input: &str) -> String {
 pub(crate) fn sanitize_terminal_text(input: &str) -> String {
     let mut output = String::with_capacity(input.len());
     let mut chars = input.chars().peekable();
-
     while let Some(character) = chars.next() {
         if character == '\u{1b}' {
-            match chars.next() {
-                Some(']') => {
-                    while let Some(next) = chars.next() {
-                        if next == '\u{7}' {
-                            break;
-                        }
-                        if next == '\u{1b}' && chars.next_if_eq(&'\\').is_some() {
-                            break;
-                        }
-                    }
-                }
-                Some('[') => {
-                    for next in chars.by_ref() {
-                        if ('@'..='~').contains(&next) {
-                            break;
-                        }
-                    }
-                }
-                Some(_) | None => {}
-            }
+            skip_ansi_sequence(&mut chars);
             continue;
         }
         if character == '\r' {
@@ -114,6 +99,22 @@ pub(crate) fn sanitize_terminal_text(input: &str) -> String {
         }
     }
     output
+}
+
+/// Render a pre-rendered string to `writer` and flush. The six public
+/// `write_*` helpers differ only in which `render_*` produces the bytes.
+fn write_rendered<W: Write>(writer: &mut W, text: &str) -> io::Result<()> {
+    writer.write_all(text.as_bytes())?;
+    writer.flush()
+}
+
+/// Render an optional counter as its decimal form, or the literal "unknown".
+/// Used for retry counts and ranking scores across activity rendering.
+fn opt_str<T: ToString>(value: Option<T>) -> String {
+    match value {
+        Some(v) => v.to_string(),
+        None => "unknown".to_owned(),
+    }
 }
 
 /// Messages emitted by memory management without coupling this lane to the
@@ -157,7 +158,7 @@ pub fn render_activity(activity: &SearchActivity) -> String {
             out.push_str(&format!(
                 "Provider {}: {hits} hit(s) in {elapsed_ms} ms (retries: {})\n",
                 sanitize_terminal_line(provider),
-                retry_count.map_or_else(|| "unknown".to_owned(), |n| n.to_string())
+                opt_str(*retry_count)
             ));
             for (index, hit) in normalized_hits.iter().enumerate() {
                 out.push_str(&format!("  Hit {}\n", index + 1));
@@ -192,7 +193,7 @@ pub fn render_activity(activity: &SearchActivity) -> String {
                 "Provider {}: ERROR after {elapsed_ms} ms: {} (retries: {})\n",
                 sanitize_terminal_line(provider),
                 sanitize_terminal_line(error),
-                retry_count.map_or_else(|| "unknown".to_owned(), |n| n.to_string())
+                opt_str(*retry_count)
             ));
         }
         SearchActivity::RankingStarted { candidates } => {
@@ -211,9 +212,7 @@ pub fn render_activity(activity: &SearchActivity) -> String {
             } else {
                 out.push_str("  Decisions:\n");
                 for decision in decisions {
-                    let score = decision
-                        .score
-                        .map_or_else(|| "unknown".to_owned(), |value| value.to_string());
+                    let score = opt_str(decision.score);
                     out.push_str(&format!(
                         "    - {} | {} | selected: {} | score: {} | decision: {}\n",
                         sanitize_terminal_line(&decision.source_id),
@@ -240,8 +239,7 @@ pub fn render_activities(activities: &[SearchActivity]) -> String {
 }
 
 pub fn write_activity<W: Write>(writer: &mut W, activity: &SearchActivity) -> io::Result<()> {
-    writer.write_all(render_activity(activity).as_bytes())?;
-    writer.flush()
+    write_rendered(writer, &render_activity(activity))
 }
 
 /// Render only the selected evidence for a turn.  `normalized_url` is the
@@ -265,8 +263,7 @@ pub fn render_sources(provenance: &TurnProvenance) -> String {
 }
 
 pub fn write_sources<W: Write>(writer: &mut W, provenance: &TurnProvenance) -> io::Result<()> {
-    writer.write_all(render_sources(provenance).as_bytes())?;
-    writer.flush()
+    write_rendered(writer, &render_sources(provenance))
 }
 
 pub fn render_help() -> String {
@@ -274,8 +271,7 @@ pub fn render_help() -> String {
 }
 
 pub fn write_help<W: Write>(writer: &mut W) -> io::Result<()> {
-    writer.write_all(render_help().as_bytes())?;
-    writer.flush()
+    write_rendered(writer, &render_help())
 }
 
 /// Format public status data only.  `AppConfig` contains no resolved
@@ -314,8 +310,7 @@ pub fn write_status<W: Write>(
     registry: &BackendRegistry,
     config_path: &Path,
 ) -> io::Result<()> {
-    writer.write_all(render_status(config, registry, config_path).as_bytes())?;
-    writer.flush()
+    write_rendered(writer, &render_status(config, registry, config_path))
 }
 
 pub fn render_compaction(notice: &CompactionNotice) -> String {
@@ -334,8 +329,7 @@ pub fn render_compaction(notice: &CompactionNotice) -> String {
 }
 
 pub fn write_compaction<W: Write>(writer: &mut W, notice: &CompactionNotice) -> io::Result<()> {
-    writer.write_all(render_compaction(notice).as_bytes())?;
-    writer.flush()
+    write_rendered(writer, &render_compaction(notice))
 }
 
 /// Format the production memory activity contract without exposing memory
@@ -356,8 +350,7 @@ pub fn render_memory_event(event: &MemoryEvent) -> String {
 }
 
 pub fn write_memory_event<W: Write>(writer: &mut W, event: &MemoryEvent) -> io::Result<()> {
-    writer.write_all(render_memory_event(event).as_bytes())?;
-    writer.flush()
+    write_rendered(writer, &render_memory_event(event))
 }
 
 #[cfg(test)]

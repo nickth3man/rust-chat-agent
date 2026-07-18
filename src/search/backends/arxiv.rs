@@ -65,15 +65,15 @@ pub fn parse_xml(input: &str, cap: usize) -> Result<Vec<SearchHit>, ToolNetError
                 current = Some(name);
             }
             Ok(Event::Text(t)) => {
-                if let Some(key) = &current {
-                    if ["id", "title", "summary", "published"].contains(&key.as_str()) {
-                        entry.insert(
-                            key.clone(),
-                            t.decode()
-                                .map_err(|e| ToolNetError::Parse(e.to_string()))?
-                                .into_owned(),
-                        );
-                    }
+                if let Some(key) = &current
+                    && ["id", "title", "summary", "published"].contains(&key.as_str())
+                {
+                    entry.insert(
+                        key.clone(),
+                        t.decode()
+                            .map_err(|e| ToolNetError::Parse(e.to_string()))?
+                            .into_owned(),
+                    );
                 }
             }
             Ok(Event::End(e)) => {
