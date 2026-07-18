@@ -4,6 +4,8 @@
 //! model.  In particular, model output is never allowed to invent, omit, or
 //! reorder an identifier without being checked against the request.
 
+pub mod chunked;
+
 use async_trait::async_trait;
 use rig_core::{
     client::CompletionClient,
@@ -52,6 +54,9 @@ pub struct RankingResult {
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 struct ModelDecision {
     candidate_id: String,
+    /// Echoed verbatim from the candidate.  This makes a truncated or
+    /// hallucinated response detectable before it can be used as evidence.
+    url: String,
     selected: bool,
     decision: String,
     score: Option<f64>,
@@ -105,7 +110,7 @@ impl Ranker for RigRanker {
         let prompt = build_prompt(&request)?;
         let schema = schemars::schema_for!(ModelOutput);
         let completion = CompletionRequestBuilder::new(self.model.clone(), prompt)
-            .preamble("Return only JSON matching the supplied schema. Rank only the supplied candidate IDs. Keep decision text concise.".to_string())
+            .preamble("Return only JSON matching the supplied schema. Rank only the supplied candidate IDs. For every decision, echo the candidate URL verbatim in the url field; never rewrite, normalize, omit, or invent a URL. Keep decision text concise.".to_string())
             .temperature(0.0)
             .max_tokens(2048)
             .output_schema(schema)
@@ -153,7 +158,7 @@ fn build_prompt(request: &RankingRequest) -> Result<String, AppError> {
         })
         .collect::<Vec<_>>();
     Ok(format!(
-        "Query: {}\nCandidates (JSON): {}\nReturn every candidate exactly once in ranked order. Set selected, score (0..1), and a concise decision.",
+        "Query: {}\nCandidates (JSON): {}\nReturn every candidate exactly once in ranked order. For each decision include candidate_id, url copied verbatim from that candidate, selected, score (0..1), and a concise decision.",
         request.query,
         serde_json::to_string(&compact).map_err(|e| AppError::RankFailed(e.to_string()))?
     ))
@@ -198,6 +203,12 @@ fn validate_and_order(
         let candidate = candidates_by_id
             .remove(decision.candidate_id.as_str())
             .expect("validated candidate ID");
+        if decision.url != candidate.hit.url {
+            return Err(AppError::RankFailed(format!(
+                "candidate URL was not echoed verbatim for {}",
+                decision.candidate_id
+            )));
+        }
         let normalized_url = candidate.hit.url.clone();
         decisions.push(RankingDecision {
             source_id: decision.candidate_id.clone(),
@@ -257,6 +268,7 @@ mod tests {
                 .iter()
                 .map(|id| ModelDecision {
                     candidate_id: (*id).into(),
+                    url: format!("https://{id}.example"),
                     selected: true,
                     decision: "good".into(),
                     score: Some(0.9),
@@ -276,6 +288,12 @@ mod tests {
         assert!(validate_and_order(request(), output(&["a", "x"])).is_err());
         assert!(validate_and_order(request(), output(&["a", "a"])).is_err());
         assert!(validate_and_order(request(), output(&["a"])).is_err());
+    }
+    #[test]
+    fn rejects_rewritten_candidate_url() {
+        let mut invalid = output(&["a", "b"]);
+        invalid.decisions[0].url = "https://rewritten.example".into();
+        assert!(validate_and_order(request(), invalid).is_err());
     }
     #[test]
     fn rejects_malformed_json() {

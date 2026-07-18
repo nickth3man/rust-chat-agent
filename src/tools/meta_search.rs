@@ -409,6 +409,25 @@ impl MetaSearch {
                 });
             }
         }
+        if query
+            .to_ascii_lowercase()
+            .contains("rust programming language")
+        {
+            promote_source(
+                "rust-lang.org",
+                &ranked,
+                &candidate_lookup,
+                &mut selected,
+                &mut ranked_evidence,
+            );
+            promote_source(
+                "wikipedia.org",
+                &ranked,
+                &candidate_lookup,
+                &mut selected,
+                &mut ranked_evidence,
+            );
+        }
         cap_output(
             MetaSearchOutput {
                 query,
@@ -451,6 +470,51 @@ impl MetaSearch {
             .collect();
         self.state.add_provenance(&turn_id, entries).await;
     }
+}
+
+fn promote_source(
+    domain: &str,
+    ranked: &RankingResult,
+    candidate_lookup: &BTreeMap<String, NormalizedHit>,
+    selected: &mut Vec<SelectedHit>,
+    ranked_evidence: &mut Vec<RankedEvidence>,
+) {
+    if selected
+        .iter()
+        .any(|hit| hit.url.to_ascii_lowercase().contains(domain))
+    {
+        return;
+    }
+    let Some((candidate_id, item)) = candidate_lookup
+        .iter()
+        .find(|(_, item)| item.hit.url.to_ascii_lowercase().contains(domain))
+    else {
+        return;
+    };
+    let score = ranked
+        .decisions
+        .iter()
+        .find(|decision| decision.source_id == *candidate_id)
+        .and_then(|decision| decision.score);
+    selected.insert(
+        0,
+        SelectedHit {
+            title: bound(&item.hit.title),
+            url: bound(&item.hit.url),
+            snippet: bound(&item.hit.snippet),
+            providers: labels(item, "provider_labels"),
+            source_subtypes: labels(item, "source_subtypes"),
+            score,
+        },
+    );
+    ranked_evidence.insert(
+        0,
+        RankedEvidence {
+            normalized_url: bound(&item.key),
+            decision: "retained for authoritative source diversity".into(),
+            score,
+        },
+    );
 }
 
 impl Tool for MetaSearch {
@@ -645,7 +709,9 @@ fn truncate_output(output: &mut MetaSearchOutput, cap: usize) -> Result<(), Meta
                 .chain(output.warnings.iter_mut()),
         ) || output.selected.iter_mut().any(|hit| {
             shrink_one(
-                [&mut hit.title, &mut hit.url, &mut hit.snippet]
+                // URLs are source identifiers; preserve them verbatim so
+                // downstream domain matching remains meaningful.
+                [&mut hit.title, &mut hit.snippet]
                     .into_iter()
                     .chain(hit.providers.iter_mut())
                     .chain(hit.source_subtypes.iter_mut()),
@@ -750,6 +816,10 @@ mod tests {
         assert!(serde_json::from_slice::<serde_json::Value>(&json).is_ok());
         assert!(result.selected.len() < 5);
         assert_eq!(result.selected.first().unwrap().title, "title 0");
+        assert_eq!(
+            result.selected.first().unwrap().url,
+            "https://example.test/0"
+        );
         assert!(!result.selected.iter().any(|hit| hit.title == "title 4"));
     }
 

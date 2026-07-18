@@ -131,6 +131,16 @@ impl BackendHttp {
         self.retry_budget = timeout;
         Ok(self)
     }
+    /// Opt in to redirects only for providers whose documented endpoint moves.
+    /// The default remains no-follow so unexpected redirects stay visible.
+    pub fn with_redirect_limit(mut self, limit: usize) -> Result<Self, ToolNetError> {
+        self.client = Client::builder()
+            .timeout(self.retry_budget)
+            .redirect(reqwest::redirect::Policy::limited(limit))
+            .build()
+            .map_err(|e| ToolNetError::Network(e.to_string()))?;
+        Ok(self)
+    }
     pub fn with_limits(mut self, max_body: usize, retry_budget: Duration) -> Self {
         self.max_body = max_body;
         self.retry_budget = retry_budget;

@@ -9,6 +9,7 @@ use std::sync::Arc;
 pub struct MarginaliaBackend {
     http: BackendHttp,
     cap: usize,
+    api_key: String,
 }
 
 #[derive(Deserialize)]
@@ -25,8 +26,8 @@ struct MarginaliaResult {
 }
 
 impl MarginaliaBackend {
-    pub fn build(http: BackendHttp, cap: usize) -> Self {
-        Self { http, cap }
+    pub fn build(http: BackendHttp, cap: usize, api_key: String) -> Self {
+        Self { http, cap, api_key }
     }
 
     pub fn from_config(
@@ -38,8 +39,13 @@ impl MarginaliaBackend {
         if !cfg.enable {
             return Ok(None);
         }
-        let _ = secret;
-        Ok(Some(Arc::new(Self::build(http, cap))))
+        let Some(api_key) = secret
+            .and_then(|value| value.api_key.as_deref())
+            .filter(|key| !key.trim().is_empty())
+        else {
+            return Ok(None);
+        };
+        Ok(Some(Arc::new(Self::build(http, cap, api_key.to_owned()))))
     }
 }
 
@@ -52,7 +58,7 @@ impl SearchBackend for MarginaliaBackend {
             .get_json_with_headers(
                 "https://api2.marginalia-search.com/search",
                 &[("query", query), ("count", &count)],
-                &[("API-Key", "public")],
+                &[("API-Key", self.api_key.as_str())],
             )
             .await?;
         Ok(parse_response(response, self.cap))

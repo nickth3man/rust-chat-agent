@@ -9,10 +9,11 @@ use std::sync::Arc;
 pub struct SemanticScholarBackend {
     http: BackendHttp,
     cap: usize,
+    api_key: String,
 }
 impl SemanticScholarBackend {
-    pub fn build(http: BackendHttp, cap: usize) -> Self {
-        Self { http, cap }
+    pub fn build(http: BackendHttp, cap: usize, api_key: String) -> Self {
+        Self { http, cap, api_key }
     }
     pub fn from_config(
         cfg: &ProviderConfig,
@@ -23,8 +24,13 @@ impl SemanticScholarBackend {
         if !cfg.enable {
             return Ok(None);
         }
-        let _ = secret;
-        Ok(Some(Arc::new(Self::build(http, cap))))
+        let Some(api_key) = secret
+            .and_then(|value| value.api_key.as_deref())
+            .filter(|key| !key.trim().is_empty())
+        else {
+            return Ok(None);
+        };
+        Ok(Some(Arc::new(Self::build(http, cap, api_key.to_owned()))))
     }
 }
 #[async_trait]
@@ -33,13 +39,14 @@ impl SearchBackend for SemanticScholarBackend {
         let cap = self.cap.to_string();
         let v: Value = self
             .http
-            .get_json(
+            .get_json_with_headers(
                 "https://api.semanticscholar.org/graph/v1/paper/search",
                 &[
                     ("query", query),
                     ("limit", &cap),
                     ("fields", "title,abstract,url,year,citationCount"),
                 ],
+                &[("x-api-key", self.api_key.as_str())],
             )
             .await?;
         parse_json_value(&v, self.cap)

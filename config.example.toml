@@ -8,7 +8,7 @@ chat_context_tokens = 12000
 
 [search]
 stage_budget_secs = 20
-rank_timeout_secs = 20
+rank_timeout_secs = 120
 per_backend_hit_cap = 5
 model_output_bytes = 6144
 
@@ -35,7 +35,8 @@ timeout_secs = 6
 user_agent = "openrouter-chat-rust/0.1 (+https://github.com/nickth3man/rust-chat-agent)"
 
 [providers.stract]
-enable = true
+# Legacy beta endpoint returns HTTP 404; keep listed but disabled.
+enable = false
 concurrency = 1
 min_interval_ms = 1000
 timeout_secs = 6
@@ -43,6 +44,7 @@ user_agent = "openrouter-chat-rust/0.1 (+https://github.com/nickth3man/rust-chat
 
 [providers.marginalia]
 enable = true
+api_key_env = "MARGINALIA_API_KEY"
 concurrency = 1
 min_interval_ms = 1000
 timeout_secs = 6
@@ -63,7 +65,8 @@ timeout_secs = 6
 user_agent = "openrouter-chat-rust/0.1 (+https://github.com/nickth3man/rust-chat-agent)"
 
 [providers.searchmysite]
-enable = true
+# The v1 JSON endpoint returns HTTP 404; keep listed but disabled.
+enable = false
 concurrency = 1
 min_interval_ms = 1000
 timeout_secs = 6
@@ -91,7 +94,8 @@ timeout_secs = 6
 user_agent = "openrouter-chat-rust/0.1 (+https://github.com/nickth3man/rust-chat-agent)"
 
 [providers.free_dictionary]
-enable = true
+# Phrase queries return HTTP 404 because this is a dictionary, not search.
+enable = false
 concurrency = 1
 min_interval_ms = 1000
 timeout_secs = 6
@@ -113,6 +117,7 @@ user_agent = "openrouter-chat-rust/0.1 (+https://github.com/nickth3man/rust-chat
 
 [providers.semantic_scholar]
 enable = true
+api_key_env = "SEMANTIC_SCHOLAR_API_KEY"
 concurrency = 1
 min_interval_ms = 1000
 timeout_secs = 6
@@ -170,18 +175,20 @@ timeout_secs = 6
 user_agent = "openrouter-chat-rust/0.1 (+https://github.com/nickth3man/rust-chat-agent)"
 
 [providers.gdelt]
-enable = true
+# Public endpoint is persistently rate-limited; keep listed but disabled.
+enable = false
 concurrency = 1
 min_interval_ms = 1000
-timeout_secs = 6
+timeout_secs = 15
 user_agent = "openrouter-chat-rust/0.1 (+https://github.com/nickth3man/rust-chat-agent)"
 
 [providers.reddit]
 enable = true
+api_key_env = "REDDIT_API_KEY"
 concurrency = 1
 min_interval_ms = 1000
 timeout_secs = 6
-user_agent = "openrouter-chat-rust/0.1 (+https://github.com/nickth3man/rust-chat-agent)"
+user_agent = "rust:openrouter-chat-rust:0.1 (by /u/openrouter_chat_rust)"
 
 [providers.lobsters]
 enable = true

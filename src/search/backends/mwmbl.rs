@@ -26,7 +26,13 @@ impl MwmblBackend {
             return Ok(None);
         }
         let _ = secret;
-        Ok(Some(Arc::new(Self::build(http, cap))))
+        // api.mwmbl.org currently redirects to the canonical API endpoint.
+        // Follow only this provider's documented redirect; other adapters
+        // retain BackendHttp's fail-closed redirect policy.
+        Ok(Some(Arc::new(Self::build(
+            http.with_redirect_limit(5)?,
+            cap,
+        ))))
     }
 }
 

@@ -172,18 +172,13 @@ mod tests {
         let enabled = registry.enabled_names();
         let key_free = [
             "duckduckgo",
-            "stract",
-            "marginalia",
             "mwmbl",
             "wiby",
-            "searchmysite",
             "wikipedia",
             "wikidata",
             "openlibrary",
-            "free_dictionary",
             "arxiv",
             "crossref",
-            "semantic_scholar",
             "pubmed",
             "hn",
             "github",
@@ -191,8 +186,6 @@ mod tests {
             "npm",
             "crates_io",
             "mdn",
-            "gdelt",
-            "reddit",
             "lobsters",
         ];
         for name in key_free {

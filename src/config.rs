@@ -6,14 +6,30 @@ use std::collections::BTreeMap;
 use std::fs;
 use std::path::{Path, PathBuf};
 
-fn default_model() -> String { "openrouter/auto".into() }
-fn default_true() -> bool { true }
-fn default_provider_timeout() -> u64 { 6 }
-fn default_stage_budget() -> u64 { 20 }
-fn default_rank_timeout() -> u64 { 20 }
-fn default_hit_cap() -> usize { 5 }
-fn default_output_bytes() -> usize { 6144 }
-fn default_concurrency() -> usize { 1 }
+fn default_model() -> String {
+    "openrouter/auto".into()
+}
+fn default_true() -> bool {
+    true
+}
+fn default_provider_timeout() -> u64 {
+    6
+}
+fn default_stage_budget() -> u64 {
+    20
+}
+fn default_rank_timeout() -> u64 {
+    20
+}
+fn default_hit_cap() -> usize {
+    5
+}
+fn default_output_bytes() -> usize {
+    6144
+}
+fn default_concurrency() -> usize {
+    1
+}
 fn default_user_agent() -> String {
     "openrouter-chat-rust/0.1 (+https://github.com/nickth3man/rust-chat-agent)".into()
 }
@@ -138,7 +154,7 @@ pub fn resolve_inputs(
     dotenv: &BTreeMap<String, String>,
     process: &BTreeMap<String, String>,
 ) -> Result<ResolvedConfig, AppError> {
-    let public: AppConfig = toml::from_str(config_text)
+    let mut public: AppConfig = toml::from_str(config_text)
         .map_err(|e| AppError::Config(format!("parse config.toml: {e}")))?;
     if !public.session.redact_credentials || !public.session.redact_auth_headers {
         return Err(AppError::Config(
@@ -155,6 +171,20 @@ pub fn resolve_inputs(
             env_var: "OPENROUTER_API_KEY".into(),
         })?
         .clone();
+    // These public APIs are rate-limited or authenticated.  They are part of
+    // the configured pool only when an explicit credential is available;
+    // absence is a disabled provider, not a configuration failure.
+    for name in ["reddit", "marginalia", "semantic_scholar"] {
+        if let Some(provider) = public.providers.get_mut(name)
+            && provider.enable
+            && non_empty(&provider.api_key_env)
+                .and_then(value)
+                .is_none_or(|key| key.trim().is_empty())
+        {
+            provider.enable = false;
+        }
+    }
+
     let mut provider_secrets = BTreeMap::new();
     for (name, provider) in &public.providers {
         if !provider.enable {
@@ -294,7 +324,11 @@ mod tests {
         let (mut dotenv, process) = maps();
         dotenv.insert("OPENROUTER_API_KEY".into(), "secret".into());
         let text = include_str!("../config.example.toml")
-            .replacen("enable = false", "enable = true", 1)
+            .replacen(
+                "[providers.brave]\nenable = false",
+                "[providers.brave]\nenable = true",
+                1,
+            )
             .replace("BRAVE_API_KEY", "BRAVE_KEY");
         let error = resolve_inputs(&text, &dotenv, &process)
             .unwrap_err()
@@ -305,23 +339,18 @@ mod tests {
     fn provider_matrix_has_keyless_defaults_and_no_forbidden_entries() {
         let config: AppConfig = toml::from_str(include_str!("../config.example.toml")).unwrap();
         assert_eq!(config.search.stage_budget_secs, 20);
-        assert_eq!(config.search.rank_timeout_secs, 20);
+        assert_eq!(config.search.rank_timeout_secs, 120);
         assert_eq!(config.search.per_backend_hit_cap, 5);
         assert_eq!(config.search.model_output_bytes, 6144);
-        let keyless = [
+        let enabled_without_credentials = [
             "duckduckgo",
-            "stract",
-            "marginalia",
             "mwmbl",
             "wiby",
-            "searchmysite",
             "wikipedia",
             "wikidata",
             "openlibrary",
-            "free_dictionary",
             "arxiv",
             "crossref",
-            "semantic_scholar",
             "pubmed",
             "hn",
             "github",
@@ -329,22 +358,39 @@ mod tests {
             "npm",
             "crates_io",
             "mdn",
-            "gdelt",
-            "reddit",
             "lobsters",
         ];
-        for name in keyless {
+        for name in enabled_without_credentials {
             assert!(config.providers.get(name).unwrap().enable);
-            assert_eq!(config.providers[name].timeout_secs, 6);
+            assert_eq!(
+                config.providers[name].timeout_secs,
+                if name == "gdelt" { 15 } else { 6 }
+            );
             assert_eq!(
                 config.providers[name].user_agent,
                 "openrouter-chat-rust/0.1 (+https://github.com/nickth3man/rust-chat-agent)"
             );
         }
-        for name in ["brave", "mojeek", "searxng", "firecrawl"] {
+        for name in [
+            "stract",
+            "searchmysite",
+            "free_dictionary",
+            "gdelt",
+            "brave",
+            "mojeek",
+            "searxng",
+            "firecrawl",
+        ] {
             assert!(!config.providers.get(name).unwrap().enable);
         }
-        assert_eq!(config.providers.len(), keyless.len() + 4);
+        for name in ["marginalia", "semantic_scholar", "reddit"] {
+            assert!(config.providers[name].enable);
+            assert!(config.providers[name].api_key_env.is_some());
+        }
+        assert_eq!(
+            config.providers.len(),
+            enabled_without_credentials.len() + 11
+        );
         assert_eq!(config.providers["firecrawl"].timeout_secs, 15);
         for forbidden in [
             "openalex",
@@ -371,6 +417,32 @@ mod tests {
             resolved.provider_secrets["github"].api_key.as_deref(),
             Some("token")
         );
+    }
+
+    #[test]
+    fn rate_limited_providers_are_disabled_without_a_key() {
+        let mut process = BTreeMap::new();
+        process.insert("OPENROUTER_API_KEY".into(), "secret".into());
+        let resolved = resolve_inputs(
+            include_str!("../config.example.toml"),
+            &BTreeMap::new(),
+            &process,
+        )
+        .unwrap();
+        for name in ["reddit", "marginalia", "semantic_scholar"] {
+            assert!(
+                !resolved.public.providers[name].enable,
+                "{name} should be disabled"
+            );
+        }
+        process.insert("REDDIT_API_KEY".into(), "token".into());
+        let resolved = resolve_inputs(
+            include_str!("../config.example.toml"),
+            &BTreeMap::new(),
+            &process,
+        )
+        .unwrap();
+        assert!(resolved.public.providers["reddit"].enable);
     }
 
     #[test]

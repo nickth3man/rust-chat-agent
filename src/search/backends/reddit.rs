@@ -10,10 +10,11 @@ use std::sync::Arc;
 pub struct RedditBackend {
     http: BackendHttp,
     cap: usize,
+    api_key: String,
 }
 impl RedditBackend {
-    pub fn build(http: BackendHttp, cap: usize) -> Self {
-        Self { http, cap }
+    pub fn build(http: BackendHttp, cap: usize, api_key: String) -> Self {
+        Self { http, cap, api_key }
     }
     pub fn from_config(
         cfg: &ProviderConfig,
@@ -24,22 +25,29 @@ impl RedditBackend {
         if !cfg.enable {
             return Ok(None);
         }
-        let _ = secret;
-        Ok(Some(Arc::new(Self::build(http, cap))))
+        let Some(api_key) = secret
+            .and_then(|value| value.api_key.as_deref())
+            .filter(|key| !key.trim().is_empty())
+        else {
+            return Ok(None);
+        };
+        Ok(Some(Arc::new(Self::build(http, cap, api_key.to_owned()))))
     }
 }
 #[async_trait]
 impl SearchBackend for RedditBackend {
     async fn search(&self, q: &str) -> Result<Vec<SearchHit>, ToolNetError> {
+        let authorization = format!("Bearer {}", self.api_key);
         let v: Value = self
             .http
-            .get_json(
+            .get_json_with_headers(
                 "https://www.reddit.com/search.json",
                 &[
                     ("q", q),
                     ("limit", &self.cap.to_string()),
                     ("sort", "relevance"),
                 ],
+                &[("Authorization", authorization.as_str())],
             )
             .await?;
         parse_value(&v, self.cap)
