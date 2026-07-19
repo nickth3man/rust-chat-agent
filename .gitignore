@@ -1,34 +1,31 @@
-# Rust build artifacts
+# --- Rust / Cargo ---
+# Build artifacts
 /target/
 
-# Local environment files (secrets — never commit)
+# Cargo.lock is intentionally NOT ignored: this crate is a binary
+# (main.rs at the crate root, no [lib] section in Cargo.toml), and the
+# Rust community convention is to commit Cargo.lock for binaries.
+
+# --- Environment / secrets ---
+# Real env file (may contain secrets); keep the example template tracked.
 .env
 .env.*
 !.env.example
-/config.toml
-/sessions/
 
-# IDE / editor
-.idea/
+# --- Editors / IDEs ---
 .vscode/
+.idea/
+*.iml
 *.swp
+*.swo
+*~
+*.bak
 
-# Rust tooling artifacts
-*.rs.bk
-mutants-out/
+# --- OS noise ---
+.DS_Store
+Thumbs.db
+desktop.ini
 
-# Profiling
-*.profraw
-*.profdata
-perf.data*
-flamegraph*
-heaptrack*
-massif*
-callgrind*
-cachegrind*
-
-# Local cargo
-.cargo/
-
-# Local deepwork progress state
-.slim/deepwork/
+# --- Logs / runtime artifacts ---
+*.log
+logs/
