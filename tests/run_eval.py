@@ -6,6 +6,7 @@ Runs each query against each model, saving results to results/<model>/<qNN>.*
 """
 import json
 import os
+import shutil
 import subprocess
 import sys
 import time
@@ -67,7 +68,6 @@ def run_one(model: str, qid: int, question: str) -> dict:
 
     # Save journal if it exists
     if journal_path.exists():
-        import shutil
         shutil.copy(journal_path, out_dir / f"q{qid:02d}.jsonl")
 
     # Parse journal for events
@@ -107,94 +107,100 @@ def run_one(model: str, qid: int, question: str) -> dict:
 def main():
     queries = load_queries()
 
-    # Backup original config
+    # Backup original config so we can always restore it, even if the run is
+    # interrupted (Ctrl-C, exception, or timeout unwinding). Without this,
+    # an aborted eval leaves config/models.json pointing at the last model
+    # under test instead of the user's configured model.
     backup_config = CONFIG.read_text(encoding="utf-8") if CONFIG.exists() else None
 
-    print(f"Models: {len(MODELS)}, Queries: {len(queries)}")
-    print(f"Total runs: {len(MODELS) * len(queries)}")
-    print(f"Results dir: {RESULTS}")
-    print()
-
-    all_results = []
-
-    for mi, (model_id, reasoning) in enumerate(MODELS, 1):
-        print(f"[{mi}/{len(MODELS)}] Model: {model_id} (reasoning={reasoning})")
-        write_config(model_id, reasoning)
-
-        for qi, (qid, question) in enumerate(queries, 1):
-            prefix = f"  [{qi}/{len(queries)}]"
-            try:
-                r = run_one(model_id, qid, question)
-                status = "OK" if r["exit_code"] == 0 else f"ERR({r['exit_code']})"
-                rsn = "R" if r["has_reasoning"] else "-"
-                rqy = "!" if r["has_requery"] else "-"
-                print(f"{prefix} q{qid:02d}: {status} {r['elapsed']}s "
-                      f"ans={r['answer_length']}ch cit={r['citations']} "
-                      f"src={r['sources']} rsn={rsn} req={rqy}")
-                all_results.append(r)
-            except subprocess.TimeoutExpired:
-                print(f"{prefix} q{qid:02d}: TIMEOUT")
-                all_results.append({
-                    "qid": qid, "question": question, "model": model_id,
-                    "exit_code": -1, "elapsed": 60,
-                    "answer_length": 0, "citations": 0, "sources": 0,
-                    "has_requery": False, "has_reasoning": False,
-                    "errors": "TIMEOUT",
-                })
-            except Exception as e:
-                print(f"{prefix} q{qid:02d}: ERROR {e}")
-                all_results.append({
-                    "qid": qid, "question": question, "model": model_id,
-                    "exit_code": -2, "elapsed": 0,
-                    "answer_length": 0, "citations": 0, "sources": 0,
-                    "has_requery": False, "has_reasoning": False,
-                    "errors": str(e)[:200],
-                })
-
-        # Summary for this model
-        model_results = [r for r in all_results if r["model"] == model_id]
-        ok = sum(1 for r in model_results if r["exit_code"] == 0)
-        avg_time = sum(r["elapsed"] for r in model_results) / len(model_results)
-        avg_len = sum(r["answer_length"] for r in model_results) / len(model_results)
-        reasoning_runs = sum(1 for r in model_results if r["has_reasoning"])
-        requeries = sum(1 for r in model_results if r["has_requery"])
-        print(f"  => {ok}/{len(model_results)} OK, avg {avg_time:.1f}s, "
-              f"avg ans={avg_len:.0f}ch, reasoning in {reasoning_runs} runs, "
-              f"{requeries} requeries")
+    try:
+        print(f"Models: {len(MODELS)}, Queries: {len(queries)}")
+        print(f"Total runs: {len(MODELS) * len(queries)}")
+        print(f"Results dir: {RESULTS}")
         print()
 
-    # Write full results as JSON for analysis
-    RESULTS.mkdir(parents=True, exist_ok=True)
-    RESULTS.joinpath("summary.json").write_text(
-        json.dumps(all_results, indent=2), encoding="utf-8"
-    )
+        all_results = []
 
-    # Per-model summary
-    print("=" * 60)
-    print("FINAL SUMMARY")
-    print("=" * 60)
+        for mi, (model_id, reasoning) in enumerate(MODELS, 1):
+            print(f"[{mi}/{len(MODELS)}] Model: {model_id} (reasoning={reasoning})")
+            write_config(model_id, reasoning)
 
-    # Restore original config
-    if backup_config:
-        CONFIG.write_text(backup_config)
+            for qi, (qid, question) in enumerate(queries, 1):
+                prefix = f"  [{qi}/{len(queries)}]"
+                try:
+                    r = run_one(model_id, qid, question)
+                    status = "OK" if r["exit_code"] == 0 else f"ERR({r['exit_code']})"
+                    rsn = "R" if r["has_reasoning"] else "-"
+                    rqy = "!" if r["has_requery"] else "-"
+                    print(f"{prefix} q{qid:02d}: {status} {r['elapsed']}s "
+                          f"ans={r['answer_length']}ch cit={r['citations']} "
+                          f"src={r['sources']} rsn={rsn} req={rqy}")
+                    all_results.append(r)
+                except subprocess.TimeoutExpired:
+                    print(f"{prefix} q{qid:02d}: TIMEOUT")
+                    all_results.append({
+                        "qid": qid, "question": question, "model": model_id,
+                        "exit_code": -1, "elapsed": 60,
+                        "answer_length": 0, "citations": 0, "sources": 0,
+                        "has_requery": False, "has_reasoning": False,
+                        "errors": "TIMEOUT",
+                    })
+                except Exception as e:
+                    print(f"{prefix} q{qid:02d}: ERROR {e}")
+                    all_results.append({
+                        "qid": qid, "question": question, "model": model_id,
+                        "exit_code": -2, "elapsed": 0,
+                        "answer_length": 0, "citations": 0, "sources": 0,
+                        "has_requery": False, "has_reasoning": False,
+                        "errors": str(e)[:200],
+                    })
 
-    for model_id, _reasoning in MODELS:
-        mr = [r for r in all_results if r["model"] == model_id]
-        ok = sum(1 for r in mr if r["exit_code"] == 0)
-        avg_t = sum(r["elapsed"] for r in mr) / len(mr) if mr else 0
-        avg_l = sum(r["answer_length"] for r in mr) / len(mr) if mr else 0
-        avg_c = sum(r["citations"] for r in mr) / len(mr) if mr else 0
-        avg_s = sum(r["sources"] for r in mr) / len(mr) if mr else 0
-        rsn = sum(1 for r in mr if r["has_reasoning"])
-        req = sum(1 for r in mr if r["has_requery"])
-        errs = [r for r in mr if r["exit_code"] != 0]
-        print(f"\n{model_id}")
-        print(f"  Success: {ok}/{len(mr)}  Avg time: {avg_t:.1f}s")
-        print(f"  Avg answer: {avg_l:.0f} chars  Avg citations: {avg_c:.1f}  Avg sources: {avg_s:.1f}")
-        print(f"  Reasoning runs: {rsn}/{len(mr)}  Requeries: {req}")
-        if errs:
-            for e in errs:
-                print(f"  ERR q{e['qid']:02d}: {e['errors'][:100]}")
+            # Summary for this model
+            model_results = [r for r in all_results if r["model"] == model_id]
+            ok = sum(1 for r in model_results if r["exit_code"] == 0)
+            avg_time = sum(r["elapsed"] for r in model_results) / len(model_results)
+            avg_len = sum(r["answer_length"] for r in model_results) / len(model_results)
+            reasoning_runs = sum(1 for r in model_results if r["has_reasoning"])
+            requeries = sum(1 for r in model_results if r["has_requery"])
+            print(f"  => {ok}/{len(model_results)} OK, avg {avg_time:.1f}s, "
+                  f"avg ans={avg_len:.0f}ch, reasoning in {reasoning_runs} runs, "
+                  f"{requeries} requeries")
+            print()
+
+        # Write full results as JSON for analysis
+        RESULTS.mkdir(parents=True, exist_ok=True)
+        RESULTS.joinpath("summary.json").write_text(
+            json.dumps(all_results, indent=2), encoding="utf-8"
+        )
+
+        # Per-model summary
+        print("=" * 60)
+        print("FINAL SUMMARY")
+        print("=" * 60)
+
+        for model_id, _reasoning in MODELS:
+            mr = [r for r in all_results if r["model"] == model_id]
+            ok = sum(1 for r in mr if r["exit_code"] == 0)
+            avg_t = sum(r["elapsed"] for r in mr) / len(mr) if mr else 0
+            avg_l = sum(r["answer_length"] for r in mr) / len(mr) if mr else 0
+            avg_c = sum(r["citations"] for r in mr) / len(mr) if mr else 0
+            avg_s = sum(r["sources"] for r in mr) / len(mr) if mr else 0
+            rsn = sum(1 for r in mr if r["has_reasoning"])
+            req = sum(1 for r in mr if r["has_requery"])
+            errs = [r for r in mr if r["exit_code"] != 0]
+            print(f"\n{model_id}")
+            print(f"  Success: {ok}/{len(mr)}  Avg time: {avg_t:.1f}s")
+            print(f"  Avg answer: {avg_l:.0f} chars  Avg citations: {avg_c:.1f}  Avg sources: {avg_s:.1f}")
+            print(f"  Reasoning runs: {rsn}/{len(mr)}  Requeries: {req}")
+            if errs:
+                for e in errs:
+                    print(f"  ERR q{e['qid']:02d}: {e['errors'][:100]}")
+    finally:
+        # Always restore the user's original config, even on Ctrl-C or
+        # unexpected exception. The journal destruction in run_one() is by
+        # design; the config clobber is the fragile part we protect here.
+        if backup_config is not None:
+            CONFIG.write_text(backup_config)
 
 
 if __name__ == "__main__":

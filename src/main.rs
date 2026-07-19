@@ -15,8 +15,9 @@
 //   6. Every step is appended to journal.jsonl
 //
 // Run:  cargo run -- "your question"
-// Config: values are read from a .env file at the project root at startup
-// (OPENROUTER_API_KEY, OPENROUTER_MODEL, FIRECRAWL_API_KEY).
+// Config: API keys are read from a .env file at the project root at startup
+// (OPENROUTER_API_KEY, FIRECRAWL_API_KEY). The model itself is selected in
+// config/models.json (parsed by load_config() below).
 
 use anyhow::{bail, Context, Result};
 use serde::Deserialize;
@@ -53,18 +54,33 @@ static TODAY: LazyLock<String> =
 // ---------------------------------------------------------------------------
 // The journal: one JSON line per event. This single file is the audit trail,
 // the dedup record, and the citation registry's paper trail all at once.
+//
+// We use `std::fs` (synchronous) rather than `tokio::fs` here and in
+// `load_config()`: these are tiny files (a few hundred bytes each) written a
+// handful of times per run. The blocking duration is negligible compared to
+// the network calls that dominate the runtime, and `tokio::fs` would add
+// noise without measurable benefit. The tokio runtime is multi-threaded, so
+// these brief synchronous calls do not stall other tasks.
 // ---------------------------------------------------------------------------
 fn journal(mut event: Value) {
     let ts = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map_or(0, |d| d.as_secs());
     event["ts"] = json!(ts);
-    if let Ok(mut f) = std::fs::OpenOptions::new()
+    // AGENTS.md declares "everything journaled" a design constraint. Surface
+    // open/write failures on stderr so silent journal loss is at least
+    // observable to the operator; do not abort the run.
+    match std::fs::OpenOptions::new()
         .create(true)
         .append(true)
         .open("journal.jsonl")
     {
-        let _ = writeln!(f, "{event}");
+        Ok(mut f) => {
+            if let Err(e) = writeln!(f, "{event}") {
+                eprintln!("warning: journal write failed: {e}");
+            }
+        }
+        Err(e) => eprintln!("warning: could not open journal.jsonl: {e}"),
     }
 }
 
@@ -73,14 +89,53 @@ fn journal(mut event: Value) {
 // Docs: https://openrouter.ai/docs/api-reference/overview
 // ---------------------------------------------------------------------------
 
-/// POST a chat-completions request body to `OpenRouter` and return the parsed
-/// JSON response. Handles API key lookup and HTTP-status errors so individual
-/// call sites only differ in the body they build and the field they read.
-async fn openrouter_call(client: &reqwest::Client, body: &Value) -> Result<Value> {
-    let key = std::env::var("OPENROUTER_API_KEY").context("OPENROUTER_API_KEY not set")?;
+// --- OpenRouter response types ---
+
+/// `OpenRouter` (OpenAI-compatible) chat-completions response. Only the
+/// fields we read are typed; the rest is ignored by serde.
+#[derive(Deserialize)]
+struct ChatResponse {
+    choices: Vec<ChatChoice>,
+}
+
+#[derive(Deserialize)]
+struct ChatChoice {
+    message: ChatMessage,
+}
+
+#[derive(Deserialize)]
+struct ChatMessage {
+    #[serde(default)]
+    content: Option<String>,
+    #[serde(default)]
+    reasoning: Option<String>,
+    #[serde(default)]
+    tool_calls: Option<Vec<ToolCall>>,
+}
+
+#[derive(Deserialize)]
+struct ToolCall {
+    function: ToolFunction,
+}
+
+#[derive(Deserialize)]
+struct ToolFunction {
+    /// JSON-encoded arguments string (per `OpenAI` tool-call spec).
+    arguments: String,
+}
+
+/// POST a JSON body with bearer auth, return the parsed JSON response.
+/// Shared by the `OpenRouter` chat-completions call and the Firecrawl
+/// search call so HTTP-status and timeout handling lives in one place.
+async fn post_json(
+    client: &reqwest::Client,
+    url: &str,
+    bearer_key: &str,
+    body: &Value,
+) -> Result<Value> {
     Ok(client
-        .post("https://openrouter.ai/api/v1/chat/completions")
-        .bearer_auth(key)
+        .post(url)
+        .bearer_auth(bearer_key)
         .json(body)
         .send()
         .await?
@@ -89,15 +144,32 @@ async fn openrouter_call(client: &reqwest::Client, body: &Value) -> Result<Value
         .await?)
 }
 
+/// POST a chat-completions request body to `OpenRouter` and return the parsed
+/// response. Delegates HTTP plumbing to `post_json` and deserializes the
+/// body into a typed `ChatResponse`.
+async fn openrouter_call(client: &reqwest::Client, body: &Value) -> Result<ChatResponse> {
+    let key = std::env::var("OPENROUTER_API_KEY").context("OPENROUTER_API_KEY not set")?;
+    let v = post_json(
+        client,
+        "https://openrouter.ai/api/v1/chat/completions",
+        &key,
+        body,
+    )
+    .await?;
+    serde_json::from_value(v).context("failed to parse OpenRouter chat response")
+}
+
 /// Reasoning/thinking models return their chain-of-thought in the `reasoning`
 /// field. When the model is configured as reasoning, journal that text if the
 /// provider supplied one. No-op for non-reasoning models.
-fn journal_reasoning(resp: &Value, config: &Config) {
+fn journal_reasoning(resp: &ChatResponse, config: &Config) {
     if !config.reasoning {
         return;
     }
-    if let Some(text) = resp["choices"][0]["message"]["reasoning"]
-        .as_str()
+    if let Some(text) = resp
+        .choices
+        .first()
+        .and_then(|c| c.message.reasoning.as_deref())
         .map(str::trim)
         .filter(|s| !s.is_empty())
     {
@@ -131,9 +203,12 @@ async fn llm(
     system: &str,
     user: &str,
 ) -> Result<String> {
-    let resp: Value = openrouter_call(client, &chat_body(config, 1500, system, user)).await?;
-    let text = resp["choices"][0]["message"]["content"]
-        .as_str()
+    let resp: ChatResponse =
+        openrouter_call(client, &chat_body(config, 1500, system, user)).await?;
+    let text = resp
+        .choices
+        .first()
+        .and_then(|c| c.message.content.as_deref())
         .context("no text in LLM response")?
         .trim()
         .to_string();
@@ -175,16 +250,15 @@ async fn rewrite_llm(
     let mut body = chat_body(config, 250, system, user);
     body["tools"] = json!([tool_schema]);
     body["tool_choice"] = json!("required");
-    let resp: Value = openrouter_call(client, &body).await?;
-    let tc = resp["choices"][0]["message"]["tool_calls"]
-        .as_array()
-        .and_then(|a| a.first())
+    let resp: ChatResponse = openrouter_call(client, &body).await?;
+    let tc = resp
+        .choices
+        .first()
+        .and_then(|c| c.message.tool_calls.as_ref())
+        .and_then(|tcs| tcs.first())
         .context("rewrite: model did not return a tool call")?;
-    let args: Value = serde_json::from_str(
-        tc["function"]["arguments"]
-            .as_str()
-            .context("rewrite: tool call missing arguments")?,
-    )?;
+    let args: Value = serde_json::from_str(&tc.function.arguments)
+        .context("rewrite: tool call missing valid arguments JSON")?;
     journal_reasoning(&resp, config);
     args["query"]
         .as_str()
@@ -216,18 +290,20 @@ async fn search(client: &reqwest::Client, query: &str, registry: &mut Vec<Source
         "sources": [{ "type": "web" }],
         "scrapeOptions": { "formats": ["markdown"], "onlyMainContent": true }
     });
-    let resp: Value = client
-        .post("https://api.firecrawl.dev/v2/search")
-        .bearer_auth(key)
-        .json(&body)
-        .send()
-        .await?
-        .error_for_status()?
-        .json()
-        .await?;
+    let resp: Value = post_json(client, "https://api.firecrawl.dev/v2/search", &key, &body).await?;
 
-    let results: Vec<FcResult> =
-        serde_json::from_value(resp["data"]["web"].clone()).unwrap_or_default();
+    // Surface response-shape drift as an explicit error instead of masking it
+    // as "no usable pages". Firecrawl's /v2/search contract is documented to
+    // return { data: { web: [ { url, title, markdown, ... }, ... ] } }; if
+    // the field is missing or the wrong type, propagate a context-rich error
+    // so the cause is diagnosable instead of looking like empty content.
+    let web_value = resp
+        .get("data")
+        .and_then(|d| d.get("web"))
+        .filter(|v| !v.is_null())
+        .context("Firecrawl /v2/search: missing or null data.web field")?;
+    let results: Vec<FcResult> = serde_json::from_value(web_value.clone())
+        .context("Firecrawl /v2/search: data.web entries failed to deserialize")?;
 
     for r in results {
         // Dedup: skip anything we've already registered (the registry IS the set).
@@ -325,7 +401,10 @@ async fn main() -> Result<()> {
     )
     .await?;
 
-    if let Some(new_query) = parse_requery(&answer) {
+    // Treat an empty requery (the model emits `SEARCH:` with no following
+    // text) as "no requery" so we don't fire a billed Firecrawl call with an
+    // empty query string. See audit H-02.
+    if let Some(new_query) = parse_requery(&answer).filter(|q| !q.is_empty()) {
         eprintln!("searching again: {new_query}");
         journal(json!({ "event": "requery", "text": new_query }));
         search(&client, &new_query, &mut registry).await?;
@@ -339,7 +418,7 @@ async fn main() -> Result<()> {
     }
 
     // 5. Honest citations: strip any [Sn] that isn't a real source ----------
-    let mut clean = strip_invalid_citations(&answer, &registry)?;
+    let mut clean = strip_invalid_citations(&answer, &registry);
 
     // 5b. One retry if the model produced a correct-looking answer with zero
     // citations (small models sometimes ignore the citation rule).
@@ -353,7 +432,7 @@ async fn main() -> Result<()> {
             answer_prompt(&anchored, &registry, true),
         );
         let retry = llm(&client, &config, &system, &retry_prompt).await?;
-        clean = strip_invalid_citations(&retry, &registry)?;
+        clean = strip_invalid_citations(&retry, &registry);
     }
 
     // 6. Print the answer + a source list built from the real registry ------

@@ -4,8 +4,11 @@
 
 use answerbot::{
     has_citations, next_source_id, parse_config, parse_requery, registry_contains_url,
-    truncate_content, Source,
+    truncate_content,
 };
+mod common;
+
+use common::{full_src, src};
 
 /// Compare two f64 values within machine epsilon. clippy denies `assert_eq!` on floats.
 fn assert_f64_eq(a: f64, b: f64) {
@@ -124,70 +127,35 @@ fn registry_contains_url_empty_registry() {
 
 #[test]
 fn registry_contains_url_found() {
-    let reg = [Source {
-        id: "S1".into(),
-        url: "https://example.com/page".into(),
-        title: String::new(),
-        content: String::new(),
-    }];
+    let reg = [full_src("S1", "", "https://example.com/page", "")];
     assert!(registry_contains_url(&reg, "https://example.com/page"));
 }
 
 #[test]
 fn registry_contains_url_not_found() {
-    let reg = [Source {
-        id: "S1".into(),
-        url: "https://example.com/page".into(),
-        title: String::new(),
-        content: String::new(),
-    }];
+    let reg = [full_src("S1", "", "https://example.com/page", "")];
     assert!(!registry_contains_url(&reg, "https://other.com"));
 }
 
 #[test]
 fn registry_contains_url_case_sensitive() {
-    let reg = [Source {
-        id: "S1".into(),
-        url: "https://Example.com".into(),
-        title: String::new(),
-        content: String::new(),
-    }];
+    let reg = [full_src("S1", "", "https://Example.com", "")];
     // Different case = no match (URLs are case-sensitive per spec).
     assert!(!registry_contains_url(&reg, "https://example.com"));
 }
 
 #[test]
 fn registry_contains_url_trailing_slash_matters() {
-    let reg = [Source {
-        id: "S1".into(),
-        url: "https://example.com/page/".into(),
-        title: String::new(),
-        content: String::new(),
-    }];
+    let reg = [full_src("S1", "", "https://example.com/page/", "")];
     assert!(!registry_contains_url(&reg, "https://example.com/page"));
 }
 
 #[test]
 fn registry_contains_url_multiple_sources() {
     let reg = [
-        Source {
-            id: "S1".into(),
-            url: "https://a.com".into(),
-            title: String::new(),
-            content: String::new(),
-        },
-        Source {
-            id: "S2".into(),
-            url: "https://b.com".into(),
-            title: String::new(),
-            content: String::new(),
-        },
-        Source {
-            id: "S3".into(),
-            url: "https://c.com".into(),
-            title: String::new(),
-            content: String::new(),
-        },
+        full_src("S1", "", "https://a.com", ""),
+        full_src("S2", "", "https://b.com", ""),
+        full_src("S3", "", "https://c.com", ""),
     ];
     assert!(registry_contains_url(&reg, "https://b.com"));
     assert!(!registry_contains_url(&reg, "https://d.com"));
@@ -202,47 +170,26 @@ fn next_source_id_empty_registry() {
 
 #[test]
 fn next_source_id_one_source() {
-    let reg = [Source {
-        id: "S1".into(),
-        url: String::new(),
-        title: String::new(),
-        content: String::new(),
-    }];
+    let reg = [src("S1")];
     assert_eq!(next_source_id(&reg), "S2");
 }
 
 #[test]
 fn next_source_id_five_sources() {
-    let reg: Vec<Source> = (1..=5)
-        .map(|i| Source {
-            id: format!("S{i}"),
-            url: String::new(),
-            title: String::new(),
-            content: String::new(),
-        })
-        .collect();
+    let reg = (1..=5).map(|i| src(&format!("S{i}"))).collect::<Vec<_>>();
     assert_eq!(next_source_id(&reg), "S6");
 }
 
 #[test]
-fn next_source_id_non_sequential_ids_ignores_gaps() {
-    // The function uses registry.len(), not the highest numeric ID, so
-    // it produces S3 even with IDs that skip numbers.
-    let reg = [
-        Source {
-            id: "S1".into(),
-            url: String::new(),
-            title: String::new(),
-            content: String::new(),
-        },
-        Source {
-            id: "S10".into(),
-            url: String::new(),
-            title: String::new(),
-            content: String::new(),
-        },
-    ];
-    assert_eq!(next_source_id(&reg), "S3");
+#[should_panic(expected = "registry invariant violated")]
+fn next_source_id_non_contiguous_panics_in_debug() {
+    // The contiguous-ID invariant is enforced by a debug_assert! (audit M-04).
+    // In debug builds (the default for `cargo test`), non-contiguous input
+    // must panic instead of silently producing a colliding ID. In release
+    // builds the assertion is compiled out and this test would fail; that is
+    // expected and the documented workflow is debug-only tests.
+    let reg = [src("S1"), src("S10")];
+    let _ = next_source_id(&reg);
 }
 
 // -- has_citations: zero-citation retry gate --------------------------------
@@ -263,14 +210,15 @@ fn has_citations_no_citation_text() {
 }
 
 #[test]
-fn has_citations_s_at_end_of_string() {
-    // "[S" at end is enough to trigger — the marker is partial.
-    assert!(has_citations("some text [S"));
+fn has_citations_partial_s_at_end_does_not_match() {
+    // `[S` alone (no digits, no closing bracket) is no longer recognized —
+    // the retry gate matches exactly what the registry / footer emit: [Sn].
+    assert!(!has_citations("some text [S"));
 }
 
 #[test]
 fn has_citations_lowercase_only() {
-    // Only checks for "[S" (uppercase S). Lowercase does not match.
+    // Lowercase [s1] is not a valid citation format; only capital [Sn] counts.
     assert!(!has_citations("[s1] test"));
 }
 
@@ -281,10 +229,24 @@ fn has_citations_numeric_without_bracket() {
 }
 
 #[test]
-fn has_citations_malformed_braces_still_matches() {
-    // Any appearance of "[S" triggers, even if not a well-formed citation.
-    assert!(has_citations("[S"));
-    assert!(has_citations("[Sabc"));
+fn has_citations_rejects_malformed_braces() {
+    // Partial or malformed "[S..." patterns no longer trigger the gate;
+    // only well-formed [Sn] citations count. Audit M-05.
+    assert!(!has_citations("[S"));
+    assert!(!has_citations("[Sabc"));
+    assert!(!has_citations("[S ]"));
+    assert!(!has_citations("[S1"));
+    assert!(!has_citations("[S1a]"));
+    assert!(!has_citations("S1]"));
+}
+
+#[test]
+fn has_citations_well_formed_matches() {
+    // Sanity: well-formed capital-S citations DO match.
+    assert!(has_citations("[S1]"));
+    assert!(has_citations("hello [S23] world"));
+    assert!(has_citations("[S1][S2]"));
+    assert!(has_citations("multi\nline [S10]\nanswer"));
 }
 
 // -- truncate_content: char-boundary-safe wrapper around String::truncate ----

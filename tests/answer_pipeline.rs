@@ -7,33 +7,10 @@ use answerbot::{
     answer_prompt, answer_system_prompt, evidence_block, rewrite_with_anchor,
     strip_invalid_citations, Source,
 };
+mod common;
+
+use common::{full_src, src};
 use regex::Regex;
-
-fn src(id: &str) -> Source {
-    Source {
-        id: id.into(),
-        url: String::new(),
-        title: String::new(),
-        content: String::new(),
-    }
-}
-
-fn full_src(id: &str, title: &str, url: &str, content: &str) -> Source {
-    Source {
-        id: id.into(),
-        title: title.into(),
-        url: url.into(),
-        content: content.into(),
-    }
-}
-
-/// `strip_invalid_citations` with the regex-error path turned into a panic.
-fn must_strip(answer: &str, registry: &[Source]) -> String {
-    let Ok(s) = strip_invalid_citations(answer, registry) else {
-        panic!("hardcoded citation regex must compile");
-    };
-    s
-}
 
 fn citation_regex() -> Regex {
     let Ok(r) = Regex::new(r"\[S\d+\]") else {
@@ -190,77 +167,87 @@ fn answer_prompt_preserves_question_verbatim() {
 #[test]
 fn strip_invalid_citations_keeps_only_registered_ids() {
     let reg = [src("S1"), src("S2")];
-    let out = must_strip("[S1] real [S99] fake [S2] real", &reg);
+    let out = strip_invalid_citations("[S1] real [S99] fake [S2] real", &reg);
     assert_eq!(out, "[S1] real  fake [S2] real");
 }
 
 #[test]
-fn strip_invalid_citations_is_case_sensitive() {
-    // The regex is \[S\d+\]; lowercase tags don't match and pass through.
+fn strip_invalid_citations_lowercase_always_stripped() {
+    // The regex \[Ss\d+\] matches both cases, but registry IDs are always
+    // capital-S, so lowercase [s1] never names a real source and is stripped.
+    // This keeps the Sources: footer (which emits [S1]) consistent: any tag
+    // that survives stripping is guaranteed to have a matching footer entry.
     let reg = [src("S1")];
-    let out = must_strip("[s1] lowercase [S1] real", &reg);
-    assert_eq!(out, "[s1] lowercase [S1] real");
+    let out = strip_invalid_citations("[s1] lowercase [S1] real", &reg);
+    assert_eq!(out, " lowercase [S1] real");
 }
 
 #[test]
 fn strip_invalid_citations_supports_multi_digit_ids() {
     let reg = [src("S10"), src("S11")];
-    let out = must_strip("[S10] a [S11] b [S9] c", &reg);
+    let out = strip_invalid_citations("[S10] a [S11] b [S9] c", &reg);
     assert_eq!(out, "[S10] a [S11] b  c");
 }
 
 #[test]
 fn strip_invalid_citations_empty_registry_strips_all() {
     let reg: [Source; 0] = [];
-    let out = must_strip("[S1][S2] hello", &reg);
+    let out = strip_invalid_citations("[S1][S2] hello", &reg);
     assert_eq!(out, " hello");
-    let out2 = must_strip("[S1][S2]", &reg);
+    let out2 = strip_invalid_citations("[S1][S2]", &reg);
     assert_eq!(out2, "");
 }
 
 #[test]
 fn strip_invalid_citations_empty_answer_returns_empty() {
     let reg = [src("S1")];
-    assert_eq!(must_strip("", &reg), "");
+    assert_eq!(strip_invalid_citations("", &reg), "");
     let empty_reg: [Source; 0] = [];
-    assert_eq!(must_strip("", &empty_reg), "");
+    assert_eq!(strip_invalid_citations("", &empty_reg), "");
 }
 
 #[test]
 fn strip_invalid_citations_no_citations_unchanged() {
     let reg = [src("S1")];
     let input = "hello world, no tags here!";
-    assert_eq!(must_strip(input, &reg), input);
+    assert_eq!(strip_invalid_citations(input, &reg), input);
 }
 
 #[test]
 fn strip_invalid_citations_adjacent_valid_kept() {
     let reg = [src("S1"), src("S2")];
-    assert_eq!(must_strip("[S1][S2]", &reg), "[S1][S2]");
+    assert_eq!(strip_invalid_citations("[S1][S2]", &reg), "[S1][S2]");
 }
 
 #[test]
 fn strip_invalid_citations_duplicate_valid_all_kept() {
     let reg = [src("S1")];
-    assert_eq!(must_strip("[S1] [S1] [S1]", &reg), "[S1] [S1] [S1]");
+    assert_eq!(
+        strip_invalid_citations("[S1] [S1] [S1]", &reg),
+        "[S1] [S1] [S1]"
+    );
 }
 
 #[test]
 fn strip_invalid_citations_at_boundaries() {
     let reg = [src("S1")];
-    assert_eq!(must_strip("[S1] foo", &reg), "[S1] foo");
-    assert_eq!(must_strip("foo [S1]", &reg), "foo [S1]");
-    assert_eq!(must_strip("[S1]", &reg), "[S1]");
+    assert_eq!(strip_invalid_citations("[S1] foo", &reg), "[S1] foo");
+    assert_eq!(strip_invalid_citations("foo [S1]", &reg), "foo [S1]");
+    assert_eq!(strip_invalid_citations("[S1]", &reg), "[S1]");
 }
 
 #[test]
 fn strip_invalid_citations_malformed_pass_through() {
+    // None of these match \[Ss\d+\] (missing digits, extra whitespace,
+    // non-digit suffix, missing bracket, etc.), so they pass through.
+    // `[s1 ]` (trailing space) still passes through — the regex requires
+    // the closing `]` immediately after the digits.
     let reg = [src("S1")];
     let cases = [
-        "[S]", "[S ]", "[ S1]", "[S1 ]", "[S-1]", "[S1a]", "[S1", "S1]", "[s1]", "[s1 ]",
+        "[S]", "[S ]", "[ S1]", "[S1 ]", "[S-1]", "[S1a]", "[S1", "S1]", "[s1 ]",
     ];
     for c in cases {
-        let out = must_strip(c, &reg);
+        let out = strip_invalid_citations(c, &reg);
         assert_eq!(out, c, "malformed case {c:?} should pass through unchanged");
     }
 }
@@ -269,7 +256,7 @@ fn strip_invalid_citations_malformed_pass_through() {
 fn strip_invalid_citations_only_valid_remain_in_output() {
     let reg = [src("S1"), src("S2")];
     let input = "[S1] real [S99] fake [S2] real [S3] nope [S10] also nope";
-    let out = must_strip(input, &reg);
+    let out = strip_invalid_citations(input, &reg);
     let re = citation_regex();
     for mat in re.find_iter(&out) {
         let tag = mat.as_str();
@@ -502,7 +489,7 @@ fn answer_system_prompt_cjk_date() {
 #[test]
 fn strip_invalid_citations_large_id_valid() {
     let reg = [src("S100"), src("S2000")];
-    let out = must_strip("[S100] valid [S2000] also [S99] invalid", &reg);
+    let out = strip_invalid_citations("[S100] valid [S2000] also [S99] invalid", &reg);
     assert_eq!(out, "[S100] valid [S2000] also  invalid");
 }
 
@@ -511,35 +498,35 @@ fn strip_invalid_citations_prefix_independence() {
     // S1 and S10 are independent IDs — having S10 in registry does NOT
     // protect S1, and vice versa.
     let reg = [src("S10")];
-    let out = must_strip("[S1] should strip [S10] kept", &reg);
+    let out = strip_invalid_citations("[S1] should strip [S10] kept", &reg);
     assert_eq!(out, " should strip [S10] kept");
 }
 
 #[test]
 fn strip_invalid_citations_reverse_prefix_independence() {
     let reg = [src("S1")];
-    let out = must_strip("[S10] should strip [S1] kept", &reg);
+    let out = strip_invalid_citations("[S10] should strip [S1] kept", &reg);
     assert_eq!(out, " should strip [S1] kept");
 }
 
 #[test]
 fn strip_invalid_citations_very_large_id() {
     let reg = [src("S999999999999999")];
-    let out = must_strip("[S999999999999999] big [S1] missing", &reg);
+    let out = strip_invalid_citations("[S999999999999999] big [S1] missing", &reg);
     assert_eq!(out, "[S999999999999999] big  missing");
 }
 
 #[test]
 fn strip_invalid_citations_mixed_valid_chain() {
     let reg = [src("S1"), src("S3")];
-    let out = must_strip("[S1][S2][S3][S4][S5]", &reg);
+    let out = strip_invalid_citations("[S1][S2][S3][S4][S5]", &reg);
     assert_eq!(out, "[S1][S3]");
 }
 
 #[test]
 fn strip_invalid_citations_strips_everything_when_no_match() {
     let reg = [src("S99")];
-    let out = must_strip("[S1][S2][S3]", &reg);
+    let out = strip_invalid_citations("[S1][S2][S3]", &reg);
     assert_eq!(out, "");
 }
 

@@ -84,6 +84,14 @@ models or rephrase the question if you hit it.
 - `MAX_CHARS_PER_SOURCE` — truncation limit per page (default 8,000)
 - `REQUEST_TIMEOUT_SECS` — hard cap per network call (default 30)
 
+`REQUEST_TIMEOUT_SECS` bounds a single HTTP call, not the whole run. The
+retry path can chain up to four sequential network calls (rewrite → search →
+answer → re-search → answer → zero-citation retry), so a single CLI
+invocation can take ~2 minutes in the worst case before any per-call timeout
+fires. Anyone wrapping the CLI in an outer timeout (e.g. `tests/run_eval.py`
+uses 60s) should account for this — slow models on the retry path will hit
+the outer limit, not the per-call one.
+
 ## Development
 
 One-time tool install:

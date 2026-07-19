@@ -58,8 +58,10 @@ Tests live in `tests/` as integration tests against the helpers in
 
 ## Configuration & secrets
 
-Runtime config comes from `.env` at the repo root (loaded by `dotenvy`):
-`OPENROUTER_API_KEY`, `OPENROUTER_MODEL`, `FIRECRAWL_API_KEY`.
+Secrets (API keys) are loaded from `.env` at the repo root (via `dotenvy`):
+`OPENROUTER_API_KEY`, `FIRECRAWL_API_KEY`. The model itself is selected in
+`config/models.json` (parsed by `parse_config` in `src/lib.rs`), not via an
+env var.
 
 - `.env` is gitignored and contains real keys — never commit, print, or copy
   its contents. Keep [.env.example](.env.example) in sync when adding variables.
