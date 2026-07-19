@@ -1,10 +1,6 @@
-// Tests for the pure orchestration helpers extracted from src/main.rs into
-// src/lib.rs: parse_config, parse_requery, registry_contains_url,
-// next_source_id, has_citations, truncate_content.
-//
-// These were previously untestable because they were inlined in main() or
-// async call sites. Each test verifies that the extracted function preserves
-// the exact runtime behaviour of the original main.rs code.
+// Tests for the pure orchestration helpers in src/lib.rs: parse_config,
+// parse_requery, registry_contains_url, next_source_id, has_citations,
+// truncate_content.
 
 use answerbot::{
     has_citations, next_source_id, parse_config, parse_requery, registry_contains_url,
@@ -291,7 +287,7 @@ fn has_citations_malformed_braces_still_matches() {
     assert!(has_citations("[Sabc"));
 }
 
-// -- truncate_content: wrapping String::truncate (preserving panic surface) -
+// -- truncate_content: char-boundary-safe wrapper around String::truncate ----
 
 #[test]
 fn truncate_content_under_limit_unchanged() {
@@ -328,11 +324,8 @@ fn truncate_content_ascii_exact_boundary() {
     assert_eq!(s, "abcde");
 }
 
-/// This test verifies that `truncate_content` no longer panics on
-/// multi-byte UTF-8 boundaries (the original `content.truncate(max)` bug).
-/// Byte layout of "héllo": 68 | C3 A9 | 6C 6C 6F — 'é' takes bytes 1-2.
-/// Truncating at byte 2 should round down to byte 0 (before 'é') rather
-/// than panicking mid-character, preserving "h" (1 byte) + content.
+/// Truncating at a non-char boundary rounds down instead of panicking.
+/// "héllo" byte layout: 68 | C3 A9 | 6C 6C 6F (é = bytes 1-2).
 #[test]
 fn truncate_content_safe_at_non_char_boundary() {
     let mut s = "héllo".to_string();

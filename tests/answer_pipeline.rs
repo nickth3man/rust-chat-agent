@@ -27,8 +27,7 @@ fn full_src(id: &str, title: &str, url: &str, content: &str) -> Source {
     }
 }
 
-/// Run `strip_invalid_citations` and panic on regex failure. The pattern is
-/// a hardcoded literal, so this branch is unreachable in practice.
+/// `strip_invalid_citations` with the regex-error path turned into a panic.
 fn must_strip(answer: &str, registry: &[Source]) -> String {
     let Ok(s) = strip_invalid_citations(answer, registry) else {
         panic!("hardcoded citation regex must compile");
