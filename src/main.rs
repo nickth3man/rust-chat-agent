@@ -72,20 +72,50 @@ fn journal(mut event: Value) {
 }
 
 // ---------------------------------------------------------------------------
-// LLM call: OpenRouter chat-completions request (OpenAI-compatible), returns
-// the text reply. Docs: https://openrouter.ai/docs/api-reference/overview
+// OpenRouter chat-completions helpers (OpenAI-compatible).
+// Docs: https://openrouter.ai/docs/api-reference/overview
 // ---------------------------------------------------------------------------
-async fn llm(
-    client: &reqwest::Client,
-    config: &Config,
-    system: &str,
-    user: &str,
-) -> Result<String> {
+
+/// POST a chat-completions request body to `OpenRouter` and return the parsed
+/// JSON response. Handles API key lookup and HTTP-status errors so individual
+/// call sites only differ in the body they build and the field they read.
+async fn openrouter_call(client: &reqwest::Client, body: &Value) -> Result<Value> {
     let key = std::env::var("OPENROUTER_API_KEY").context("OPENROUTER_API_KEY not set")?;
+    Ok(client
+        .post("https://openrouter.ai/api/v1/chat/completions")
+        .bearer_auth(key)
+        .json(body)
+        .send()
+        .await?
+        .error_for_status()?
+        .json()
+        .await?)
+}
+
+/// Reasoning/thinking models return their chain-of-thought in the `reasoning`
+/// field. When the model is configured as reasoning, journal that text if the
+/// provider supplied one. No-op for non-reasoning models.
+fn journal_reasoning(resp: &Value, config: &Config) {
+    if !config.reasoning {
+        return;
+    }
+    if let Some(text) = resp["choices"][0]["message"]["reasoning"]
+        .as_str()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+    {
+        journal(json!({ "event": "reasoning", "text": text }));
+    }
+}
+
+/// Common chat-completions body (model, temperature, `max_tokens`, messages)
+/// shared by every LLM call. Adds the empty `reasoning` object that
+/// reasoning-capable models expect when configured.
+fn chat_body(config: &Config, max_tokens: u64, system: &str, user: &str) -> Value {
     let mut body = json!({
         "model": config.model,
         "temperature": config.temperature,
-        "max_tokens": 1500,
+        "max_tokens": max_tokens,
         "messages": [
             { "role": "system", "content": system },
             { "role": "user", "content": user }
@@ -94,30 +124,23 @@ async fn llm(
     if config.reasoning {
         body["reasoning"] = json!({});
     }
-    let resp: Value = client
-        .post("https://openrouter.ai/api/v1/chat/completions")
-        .bearer_auth(key)
-        .json(&body)
-        .send()
-        .await?
-        .error_for_status()?
-        .json()
-        .await?;
+    body
+}
+
+/// Answering LLM call: returns the text reply from a plain chat completion.
+async fn llm(
+    client: &reqwest::Client,
+    config: &Config,
+    system: &str,
+    user: &str,
+) -> Result<String> {
+    let resp: Value = openrouter_call(client, &chat_body(config, 1500, system, user)).await?;
     let text = resp["choices"][0]["message"]["content"]
         .as_str()
         .context("no text in LLM response")?
         .trim()
         .to_string();
-    // Reasoning/thinking models return their chain-of-thought in the
-    // `reasoning` field. Only parse when the model is configured as reasoning.
-    if config.reasoning {
-        if let Some(reasoning) = resp["choices"][0]["message"]["reasoning"].as_str() {
-            let reasoning = reasoning.trim().to_string();
-            if !reasoning.is_empty() {
-                journal(json!({ "event": "reasoning", "text": reasoning }));
-            }
-        }
-    }
+    journal_reasoning(&resp, config);
     Ok(text)
 }
 
@@ -152,31 +175,11 @@ async fn rewrite_llm(
     system: &str,
     user: &str,
 ) -> Result<String> {
-    let key = std::env::var("OPENROUTER_API_KEY").context("OPENROUTER_API_KEY not set")?;
     let tool_schema: Value = serde_json::from_str(REWRITE_TOOL)?;
-    let mut body = json!({
-        "model": config.model,
-        "temperature": config.temperature,
-        "max_tokens": 250,
-        "messages": [
-            { "role": "system", "content": system },
-            { "role": "user", "content": user }
-        ],
-        "tools": [tool_schema],
-        "tool_choice": "required"
-    });
-    if config.reasoning {
-        body["reasoning"] = json!({});
-    }
-    let resp: Value = client
-        .post("https://openrouter.ai/api/v1/chat/completions")
-        .bearer_auth(key)
-        .json(&body)
-        .send()
-        .await?
-        .error_for_status()?
-        .json()
-        .await?;
+    let mut body = chat_body(config, 250, system, user);
+    body["tools"] = json!([tool_schema]);
+    body["tool_choice"] = json!("required");
+    let resp: Value = openrouter_call(client, &body).await?;
     let tc = resp["choices"][0]["message"]["tool_calls"]
         .as_array()
         .and_then(|a| a.first())
@@ -186,14 +189,7 @@ async fn rewrite_llm(
             .as_str()
             .context("rewrite: tool call missing arguments")?,
     )?;
-    if config.reasoning {
-        if let Some(reasoning) = resp["choices"][0]["message"]["reasoning"].as_str() {
-            let reasoning = reasoning.trim().to_string();
-            if !reasoning.is_empty() {
-                journal(json!({ "event": "reasoning", "text": reasoning }));
-            }
-        }
-    }
+    journal_reasoning(&resp, config);
     args["query"]
         .as_str()
         .map(|s| s.trim().to_string())
@@ -324,10 +320,11 @@ async fn main() -> Result<()> {
     }
 
     // 4. Answer — with exactly one re-search allowed ------------------------
+    let system = answer_system_prompt(&TODAY);
     let mut answer = llm(
         &client,
         &config,
-        &answer_system_prompt(&TODAY),
+        &system,
         &answer_prompt(&anchored, &registry, false),
     )
     .await?;
@@ -339,7 +336,7 @@ async fn main() -> Result<()> {
         answer = llm(
             &client,
             &config,
-            &answer_system_prompt(&TODAY),
+            &system,
             &answer_prompt(&anchored, &registry, true),
         )
         .await?;
@@ -361,21 +358,16 @@ async fn main() -> Result<()> {
              Rewrite your answer now with citations.",
             answer_prompt(&anchored, &registry, true),
         );
-        let retry = llm(
-            &client,
-            &config,
-            &answer_system_prompt(&TODAY),
-            &retry_prompt,
-        )
-        .await?;
+        let retry = llm(&client, &config, &system, &retry_prompt).await?;
         clean = strip_invalid_citations(&retry, &registry)?;
     }
 
     // 6. Print the answer + a source list built from the real registry ------
     println!("\n{clean}\n\nSources:");
     for s in &registry {
-        if clean.contains(&format!("[{}]", s.id)) {
-            println!("  [{}] {} — {}", s.id, s.title, s.url);
+        let tag = format!("[{}]", s.id);
+        if clean.contains(&tag) {
+            println!("  {tag} {} — {}", s.title, s.url);
         }
     }
     journal(json!({ "event": "answer", "text": clean }));
