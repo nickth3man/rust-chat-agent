@@ -33,6 +33,38 @@ const MAX_SOURCES_PER_SEARCH: usize = 4; // pages Firecrawl reads per trip
 const MAX_CHARS_PER_SOURCE: usize = 8_000; // truncate long pages ("safe limits")
 const REQUEST_TIMEOUT_SECS: u64 = 30;
 
+// ---------------------------------------------------------------------------
+// Model configuration — loaded from config/models.json at startup.
+// Secrets (API keys) stay in .env; model selection and tuning live here.
+// ---------------------------------------------------------------------------
+#[derive(Deserialize)]
+struct Config {
+    model: String,
+    #[serde(default = "default_temperature")]
+    temperature: f64,
+    /// Whether the model supports reasoning/thinking (chain-of-thought).
+    /// When true, `reasoning: {}` is sent and reasoning is parsed from the
+    /// response. Non-reasoning models may reject unknown parameters — set
+    /// this to false for those.
+    #[serde(default = "default_true")]
+    reasoning: bool,
+}
+
+fn default_temperature() -> f64 {
+    0.7
+}
+
+fn default_true() -> bool {
+    true
+}
+
+fn load_config() -> Result<Config> {
+    let path = "config/models.json";
+    let contents =
+        std::fs::read_to_string(path).with_context(|| format!("failed to read {path}"))?;
+    serde_json::from_str(&contents).context("failed to parse config/models.json")
+}
+
 /// Today's date in the user's local timezone as YYYY-MM-DD. Computed once per
 /// process — this binary is single-shot per `cargo run`, so per-call refresh
 /// buys nothing and would invalidate prompt-cache prefixes that the LLM
@@ -62,17 +94,25 @@ fn journal(mut event: Value) {
 // LLM call: OpenRouter chat-completions request (OpenAI-compatible), returns
 // the text reply. Docs: https://openrouter.ai/docs/api-reference/overview
 // ---------------------------------------------------------------------------
-async fn llm(client: &reqwest::Client, system: &str, user: &str) -> Result<String> {
+async fn llm(
+    client: &reqwest::Client,
+    config: &Config,
+    system: &str,
+    user: &str,
+) -> Result<String> {
     let key = std::env::var("OPENROUTER_API_KEY").context("OPENROUTER_API_KEY not set")?;
-    let model = std::env::var("OPENROUTER_MODEL").context("OPENROUTER_MODEL not set")?;
-    let body = json!({
-        "model": model,
+    let mut body = json!({
+        "model": config.model,
+        "temperature": config.temperature,
         "max_tokens": 1500,
         "messages": [
             { "role": "system", "content": system },
             { "role": "user", "content": user }
         ]
     });
+    if config.reasoning {
+        body["reasoning"] = json!({});
+    }
     let resp: Value = client
         .post("https://openrouter.ai/api/v1/chat/completions")
         .bearer_auth(key)
@@ -87,6 +127,16 @@ async fn llm(client: &reqwest::Client, system: &str, user: &str) -> Result<Strin
         .context("no text in LLM response")?
         .trim()
         .to_string();
+    // Reasoning/thinking models return their chain-of-thought in the
+    // `reasoning` field. Only parse when the model is configured as reasoning.
+    if config.reasoning {
+        if let Some(reasoning) = resp["choices"][0]["message"]["reasoning"].as_str() {
+            let reasoning = reasoning.trim().to_string();
+            if !reasoning.is_empty() {
+                journal(json!({ "event": "reasoning", "text": reasoning }));
+            }
+        }
+    }
     Ok(text)
 }
 
@@ -115,12 +165,17 @@ const REWRITE_TOOL: &str = r#"{
 /// Forced-tool-call LLM for query rewriting. Sends `tool_choice: "required"`
 /// so the model must respond with a `generate_search_query` tool call.
 /// No sentinel, no fallback \u{2014} the model returns a query or the call fails.
-async fn rewrite_llm(client: &reqwest::Client, system: &str, user: &str) -> Result<String> {
+async fn rewrite_llm(
+    client: &reqwest::Client,
+    config: &Config,
+    system: &str,
+    user: &str,
+) -> Result<String> {
     let key = std::env::var("OPENROUTER_API_KEY").context("OPENROUTER_API_KEY not set")?;
-    let model = std::env::var("OPENROUTER_MODEL").context("OPENROUTER_MODEL not set")?;
     let tool_schema: Value = serde_json::from_str(REWRITE_TOOL)?;
-    let body = json!({
-        "model": model,
+    let mut body = json!({
+        "model": config.model,
+        "temperature": config.temperature,
         "max_tokens": 250,
         "messages": [
             { "role": "system", "content": system },
@@ -129,6 +184,9 @@ async fn rewrite_llm(client: &reqwest::Client, system: &str, user: &str) -> Resu
         "tools": [tool_schema],
         "tool_choice": "required"
     });
+    if config.reasoning {
+        body["reasoning"] = json!({});
+    }
     let resp: Value = client
         .post("https://openrouter.ai/api/v1/chat/completions")
         .bearer_auth(key)
@@ -147,6 +205,14 @@ async fn rewrite_llm(client: &reqwest::Client, system: &str, user: &str) -> Resu
             .as_str()
             .context("rewrite: tool call missing arguments")?,
     )?;
+    if config.reasoning {
+        if let Some(reasoning) = resp["choices"][0]["message"]["reasoning"].as_str() {
+            let reasoning = reasoning.trim().to_string();
+            if !reasoning.is_empty() {
+                journal(json!({ "event": "reasoning", "text": reasoning }));
+            }
+        }
+    }
     args["query"]
         .as_str()
         .map(|s| s.trim().to_string())
@@ -242,6 +308,8 @@ async fn main() -> Result<()> {
         }
     }
 
+    let config = load_config()?;
+
     // 1. You ask -----------------------------------------------------------
     let question: String = std::env::args().skip(1).collect::<Vec<_>>().join(" ");
     if question.is_empty() {
@@ -263,7 +331,7 @@ async fn main() -> Result<()> {
         .build()?;
 
     // 2. Rewrite the question into one good search query -------------------
-    let query = rewrite_llm(&client, QUERY_SYSTEM, &anchored).await?;
+    let query = rewrite_llm(&client, &config, QUERY_SYSTEM, &anchored).await?;
     eprintln!("searching: {query}");
     journal(json!({ "event": "query", "text": query }));
 
@@ -277,6 +345,7 @@ async fn main() -> Result<()> {
     // 4. Answer — with exactly one re-search allowed ------------------------
     let mut answer = llm(
         &client,
+        &config,
         &answer_system_prompt(&TODAY),
         &answer_prompt(&anchored, &registry, false),
     )
@@ -289,6 +358,7 @@ async fn main() -> Result<()> {
         search(&client, new_query, &mut registry).await?;
         answer = llm(
             &client,
+            &config,
             &answer_system_prompt(&TODAY),
             &answer_prompt(&anchored, &registry, true),
         )
@@ -296,7 +366,30 @@ async fn main() -> Result<()> {
     }
 
     // 5. Honest citations: strip any [Sn] that isn't a real source ----------
-    let clean = strip_invalid_citations(&answer, &registry)?;
+    let mut clean = strip_invalid_citations(&answer, &registry)?;
+
+    // 5b. One retry if the model produced a correct-looking answer with zero
+    // citations. Some small/weak models (notably gpt-oss-20b) follow the
+    // system prompt's content rules but ignore the citation rule entirely.
+    // A single reminder re-prompt catches these without an unbounded loop.
+    if !clean.contains("[S") && !registry.is_empty() {
+        journal(json!({ "event": "no_citations_retry" }));
+        eprintln!("retry: previous answer had no citations");
+        let retry_prompt = format!(
+            "{}\n\nIMPORTANT: Your previous answer contained zero source citations. \
+             Every factual claim must end with [Sn] matching a source above. \
+             Rewrite your answer now with citations.",
+            answer_prompt(&anchored, &registry, true),
+        );
+        let retry = llm(
+            &client,
+            &config,
+            &answer_system_prompt(&TODAY),
+            &retry_prompt,
+        )
+        .await?;
+        clean = strip_invalid_citations(&retry, &registry)?;
+    }
 
     // 6. Print the answer + a source list built from the real registry ------
     println!("\n{clean}\n\nSources:");

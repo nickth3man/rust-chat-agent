@@ -13,10 +13,10 @@ and every step lands in `journal.jsonl`.
    - OpenRouter: https://openrouter.ai
    - Firecrawl: https://firecrawl.dev
 3. Copy `.env.example` to `.env` and fill in:
-   - `OPENROUTER_API_KEY`
-   - `OPENROUTER_MODEL` (e.g. `anthropic/claude-sonnet-4.5`)
-   - `FIRECRAWL_API_KEY`
-4. Run:
+    - `OPENROUTER_API_KEY`
+    - `FIRECRAWL_API_KEY`
+4. Choose a model in `config/models.json` (model name and temperature).
+5. Run:
 
 ```bash
 cargo run --release -- "what changed in the latest Rust edition?"
@@ -32,6 +32,51 @@ cargo run --release -- "what changed in the latest Rust edition?"
 | One re-search allowed if needed | the `SEARCH:` branch |
 | Citations kept honest | the regex strip near the end |
 | Everything noted in one file | `journal()` → `journal.jsonl` |
+
+## Configuration
+
+Model selection and tuning live in `config/models.json`:
+
+```json
+{
+  "model": "openai/gpt-oss-20b",
+  "temperature": 0.7,
+  "reasoning": true
+}
+```
+
+- `model` — OpenRouter model id (browse all at https://openrouter.ai/models)
+- `temperature` — sampling temperature; reasoning/thinking models ignore it
+- `reasoning` — `true` sends `reasoning: {}` and journals the chain-of-thought;
+  `false` (or omitted, defaulting to `true`) skips both. **Required for
+  non-reasoning models** — some providers (e.g. Mistral via Cloudflare) reject
+  the unknown parameter with HTTP 400.
+
+Secrets (API keys) stay in `.env`.
+
+## Model compatibility
+
+Tested against four OpenRouter models at under ~$0.20/1M tokens:
+
+| Model                                    | Reasoning | Citations per answer | Notes                       |
+| ---------------------------------------- | --------- | -------------------- | --------------------------- |
+| `openai/gpt-oss-20b`                       | yes       | ~1.9 avg             | requires `reasoning: true`    |
+| `google/gemini-2.5-flash-lite`             | optional  | ~5.5 avg             | accepts `reasoning` but never returns it |
+| `mistralai/mistral-small-3.2-24b-instruct` | no        | ~5.1 avg             | requires `reasoning: false`   |
+| `meta-llama/llama-4-scout`                 | no        | ~4.3 avg             | requires `reasoning: false`   |
+
+The answer loop has one zero-citation retry built in (`src/main.rs:368-388`):
+if the model's first answer has no `[Sn]` citations despite having sources
+available, it is re-prompted with a citation reminder. This catches
+instruction-following gaps in smaller reasoning models. The retry is bounded —
+exactly one, same as the `SEARCH:` re-search limit — to keep the structural
+constraints from AGENTS.md intact.
+
+Known flaky case: `openai/gpt-oss-20b` occasionally refuses the forced tool
+call for the query-rewrite step on historical questions (e.g. "When did World
+War II end?"), failing with `rewrite: model did not return a tool call`. This
+is logged in `journal.jsonl` as a failure exit and is not retried; switch
+models or rephrase the question if you hit it.
 
 ## Knobs (top of `main.rs`)
 

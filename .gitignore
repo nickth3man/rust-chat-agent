@@ -34,3 +34,5 @@ desktop.ini
 logs/
 # Append-only audit trail written by every run.
 journal.jsonl
+# Multi-model evaluation harness output (tests/run_eval.py writes here).
+results/
