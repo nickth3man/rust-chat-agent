@@ -22,13 +22,23 @@ use anyhow::{bail, Context, Result};
 use serde::Deserialize;
 use serde_json::{json, Value};
 use std::io::Write;
+use std::sync::LazyLock;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use answerbot::{answer_prompt, strip_invalid_citations, Source};
+use answerbot::{
+    answer_prompt, answer_system_prompt, rewrite_with_anchor, strip_invalid_citations, Source,
+};
 
 const MAX_SOURCES_PER_SEARCH: usize = 4; // pages Firecrawl reads per trip
 const MAX_CHARS_PER_SOURCE: usize = 8_000; // truncate long pages ("safe limits")
 const REQUEST_TIMEOUT_SECS: u64 = 30;
+
+/// Today's date in the user's local timezone as YYYY-MM-DD. Computed once per
+/// process — this binary is single-shot per `cargo run`, so per-call refresh
+/// buys nothing and would invalidate prompt-cache prefixes that the LLM
+/// provider may otherwise share across sessions.
+static TODAY: LazyLock<String> =
+    LazyLock::new(|| chrono::Local::now().format("%Y-%m-%d").to_string());
 
 // ---------------------------------------------------------------------------
 // The journal: one JSON line per event. This single file is the audit trail,
@@ -140,12 +150,6 @@ async fn search(client: &reqwest::Client, query: &str, registry: &mut Vec<Source
     Ok(())
 }
 
-const ANSWER_SYSTEM: &str = "You are a research assistant. Answer the user's question \
-using ONLY the provided sources. Cite every factual claim with its source id in \
-brackets, e.g. [S1]. If — and only if — the sources genuinely cannot answer the \
-question, reply with exactly one line: SEARCH: <a better search query>. Otherwise, \
-answer directly. Never invent sources.";
-
 const QUERY_SYSTEM: &str = "Rewrite the user's question as a short, effective web \
 search query. Reply with the query only — no quotes, no explanation.";
 
@@ -166,13 +170,22 @@ async fn main() -> Result<()> {
         bail!("usage: answerbot \"your question\"");
     }
     journal(json!({ "event": "question", "text": question }));
+    let anchored = rewrite_with_anchor(&question, &TODAY);
+    if anchored != question {
+        journal(json!({
+            "event": "anchor",
+            "original": question,
+            "rewritten": anchored,
+            "today": *TODAY,
+        }));
+    }
 
     let client = reqwest::Client::builder()
         .timeout(std::time::Duration::from_secs(REQUEST_TIMEOUT_SECS))
         .build()?;
 
     // 2. Rewrite the question into one good search query -------------------
-    let query = llm(&client, QUERY_SYSTEM, &question).await?;
+    let query = llm(&client, QUERY_SYSTEM, &anchored).await?;
     eprintln!("searching: {query}");
     journal(json!({ "event": "query", "text": query }));
 
@@ -186,8 +199,8 @@ async fn main() -> Result<()> {
     // 4. Answer — with exactly one re-search allowed ------------------------
     let mut answer = llm(
         &client,
-        ANSWER_SYSTEM,
-        &answer_prompt(&question, &registry, false),
+        &answer_system_prompt(&TODAY),
+        &answer_prompt(&anchored, &registry, false),
     )
     .await?;
 
@@ -198,8 +211,8 @@ async fn main() -> Result<()> {
         search(&client, new_query, &mut registry).await?;
         answer = llm(
             &client,
-            ANSWER_SYSTEM,
-            &answer_prompt(&question, &registry, true),
+            &answer_system_prompt(&TODAY),
+            &answer_prompt(&anchored, &registry, true),
         )
         .await?;
     }

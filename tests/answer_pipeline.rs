@@ -3,7 +3,10 @@
 //   - answer_prompt: builds the question + sources prompt with optional insist
 //   - strip_invalid_citations: validates [Sn] tags against the actual registry
 
-use answerbot::{answer_prompt, evidence_block, strip_invalid_citations, Source};
+use answerbot::{
+    answer_prompt, answer_system_prompt, evidence_block, rewrite_with_anchor,
+    strip_invalid_citations, Source,
+};
 use regex::Regex;
 
 fn src(id: &str) -> Source {
@@ -282,4 +285,120 @@ fn strip_invalid_citations_only_valid_remain_in_output() {
     assert!(!out.contains("[S10]"));
     assert!(out.contains("[S1]"));
     assert!(out.contains("[S2]"));
+}
+
+// -- answer_system_prompt: placeholder substitution ----------------------
+
+#[test]
+fn answer_system_prompt_substitutes_today_marker() {
+    let out = answer_system_prompt("2026-07-18");
+    assert!(
+        out.contains("The current date is 2026-07-18"),
+        "rendered prompt missing date line: {out:?}"
+    );
+}
+
+#[test]
+fn answer_system_prompt_substitutes_exactly_once() {
+    let out = answer_system_prompt("2026-07-18");
+    assert_eq!(
+        out.matches("2026-07-18").count(),
+        1,
+        "expected exactly one substitution"
+    );
+}
+
+#[test]
+fn answer_system_prompt_leaks_no_placeholder() {
+    let out = answer_system_prompt("2026-07-18");
+    assert!(
+        !out.contains("{{current_date}}"),
+        "placeholder should be substituted, got {out:?}"
+    );
+}
+
+#[test]
+fn answer_system_prompt_date_can_be_any_iso_string() {
+    assert!(answer_system_prompt("1999-12-31").contains("1999-12-31"));
+    assert!(answer_system_prompt("2026-01-01").contains("2026-01-01"));
+}
+
+// -- rewrite_with_anchor: relative-time phrase detection -----------------
+
+#[test]
+fn rewrite_with_anchor_passthrough_when_no_phrase() {
+    assert_eq!(
+        rewrite_with_anchor("What is Rust?", "2026-07-18"),
+        "What is Rust?"
+    );
+    assert_eq!(
+        rewrite_with_anchor("Who created Python?", "2026-07-18"),
+        "Who created Python?"
+    );
+}
+
+#[test]
+fn rewrite_with_anchor_appends_for_latest() {
+    assert_eq!(
+        rewrite_with_anchor("What is the latest Rust release?", "2026-07-18"),
+        "What is the latest Rust release? (as of 2026-07-18)"
+    );
+}
+
+#[test]
+fn rewrite_with_anchor_appends_for_today_and_recent() {
+    assert_eq!(
+        rewrite_with_anchor("Today's headlines?", "2026-07-18"),
+        "Today's headlines? (as of 2026-07-18)"
+    );
+    assert_eq!(
+        rewrite_with_anchor("Recent fusion breakthroughs?", "2026-07-18"),
+        "Recent fusion breakthroughs? (as of 2026-07-18)"
+    );
+}
+
+#[test]
+fn rewrite_with_anchor_appends_for_this_year() {
+    assert_eq!(
+        rewrite_with_anchor("Top languages this year?", "2026-07-18"),
+        "Top languages this year? (as of 2026-07-18)"
+    );
+}
+
+#[test]
+fn rewrite_with_anchor_is_case_insensitive() {
+    assert_eq!(
+        rewrite_with_anchor("LATEST version of Rust", "2026-07-18"),
+        "LATEST version of Rust (as of 2026-07-18)"
+    );
+    assert_eq!(
+        rewrite_with_anchor("latest version of Rust", "2026-07-18"),
+        "latest version of Rust (as of 2026-07-18)"
+    );
+}
+
+#[test]
+fn rewrite_with_anchor_skips_already_dated_questions() {
+    assert_eq!(
+        rewrite_with_anchor("What was the latest as of 2024?", "2026-07-18"),
+        "What was the latest as of 2024?"
+    );
+    assert_eq!(
+        rewrite_with_anchor("Revenue as of Q1?", "2026-07-18"),
+        "Revenue as of Q1?"
+    );
+}
+
+#[test]
+fn rewrite_with_anchor_preserves_question_whitespace() {
+    let q = "What is the\nlatest\tRust release?";
+    assert_eq!(
+        rewrite_with_anchor(q, "2026-07-18"),
+        "What is the\nlatest\tRust release? (as of 2026-07-18)"
+    );
+}
+
+#[test]
+fn rewrite_with_anchor_empty_passthrough() {
+    assert_eq!(rewrite_with_anchor("", "2026-07-18"), "");
 }

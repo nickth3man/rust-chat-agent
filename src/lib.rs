@@ -59,3 +59,56 @@ pub fn answer_prompt(question: &str, registry: &[Source], insist: bool) -> Strin
         evidence_block(registry)
     )
 }
+
+// ---------------------------------------------------------------------------
+// Temporal anchor helpers (Option #6 implementation). See the plan in
+// the conversation or the README for design rationale.
+// ---------------------------------------------------------------------------
+
+/// Phrases that imply a relative-time anchor. When any are present
+/// (case-insensitive) and the question does not already contain "as of",
+/// `rewrite_with_anchor` suffixes the question with `(as of <today>)` so the
+/// search-rewrite step has a concrete date to relativize "latest", "recent",
+/// etc. against. Conservative list — common false positives ("current" as in
+/// "current directory", "this week's weather", etc.) are deliberately omitted.
+const ANCHOR_PHRASES: &[&str] = &[
+    "latest",
+    "recent",
+    "recently",
+    "today",
+    "yesterday",
+    "tomorrow",
+    "this year",
+    "this month",
+    "this week",
+    "this quarter",
+];
+
+/// Render the answering system prompt with the current date injected into
+/// the `{{current_date}}` placeholder. Mirrors the `FastChat` convention:
+/// per-render substitution of a placeholder in a static template.
+pub fn answer_system_prompt(today: &str) -> String {
+    ANSWER_SYSTEM_TEMPLATE.replace("{{current_date}}", today)
+}
+
+/// Suffix `"(as of <today>)"` to a question only when (a) the question uses
+/// a relative-time phrase, and (b) it does not already pin its own date
+/// with "as of". Pure: returns the input unchanged otherwise.
+pub fn rewrite_with_anchor(question: &str, today: &str) -> String {
+    let lower = question.to_ascii_lowercase();
+    if lower.contains("as of") {
+        return question.to_string();
+    }
+    let needs_anchor = ANCHOR_PHRASES.iter().any(|p| lower.contains(p));
+    if needs_anchor {
+        format!("{question} (as of {today})")
+    } else {
+        question.to_string()
+    }
+}
+
+const ANSWER_SYSTEM_TEMPLATE: &str = "You are a research assistant. Answer the user's question \
+using ONLY the provided sources. Cite every factual claim with its source id in \
+brackets, e.g. [S1]. If — and only if — the sources genuinely cannot answer the \
+question, reply with exactly one line: SEARCH: <a better search query>. Otherwise, \
+answer directly. Never invent sources.\n\nThe current date is {{current_date}}.";
