@@ -15,9 +15,10 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - uses: dtolnay/rust-toolchain@stable
-        with:
-          components: rustfmt, clippy
+      # Install the exact toolchain pinned in rust-toolchain.toml (rustup
+      # reads it automatically), so CI and local run the same Rust version.
+      - name: Install pinned toolchain
+        run: rustup show active-toolchain || rustup toolchain install
 
       - uses: Swatinem/rust-cache@v2
 

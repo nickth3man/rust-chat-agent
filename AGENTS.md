@@ -45,7 +45,10 @@ No tests exist yet (intentional). If you add some, uncomment the test step in
 - **Formatting** is rustfmt defaults plus [rustfmt.toml](rustfmt.toml) (stable
   options only — unstable options break `cargo fmt` on the pinned stable
   toolchain). Always run `just fmt` before committing.
-- **Toolchain** is pinned to stable via [rust-toolchain.toml](rust-toolchain.toml).
+- **Toolchain** is pinned to an exact Rust version in
+  [rust-toolchain.toml](rust-toolchain.toml) — the single source of truth that
+  both local rustup and CI honor. Bump it there (nowhere else), and verify with
+  `just ci`.
 - **Dependencies**: `Cargo.lock` is committed (binary crate). New deps must
   pass `just deny` — if a new license appears, extend the allowlist in
   [deny.toml](deny.toml) with exactly that license, nothing broader.
