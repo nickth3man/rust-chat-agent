@@ -58,8 +58,7 @@ fn journal(event: Value) {
 // ---------------------------------------------------------------------------
 async fn llm(client: &reqwest::Client, system: &str, user: &str) -> Result<String> {
     let key = std::env::var("OPENROUTER_API_KEY").context("OPENROUTER_API_KEY not set")?;
-    let model =
-        std::env::var("OPENROUTER_MODEL").context("OPENROUTER_MODEL not set")?;
+    let model = std::env::var("OPENROUTER_MODEL").context("OPENROUTER_MODEL not set")?;
     let body = json!({
         "model": model,
         "max_tokens": 1500,
@@ -101,11 +100,7 @@ struct FcResult {
     description: Option<String>,
 }
 
-async fn search(
-    client: &reqwest::Client,
-    query: &str,
-    registry: &mut Vec<Source>,
-) -> Result<()> {
+async fn search(client: &reqwest::Client, query: &str, registry: &mut Vec<Source>) -> Result<()> {
     let key = std::env::var("FIRECRAWL_API_KEY").context("FIRECRAWL_API_KEY not set")?;
     let body = json!({
         "query": query,
@@ -139,7 +134,12 @@ async fn search(
         }
         let id = format!("S{}", registry.len() + 1);
         journal(json!({ "event": "source", "id": id, "url": r.url, "query": query }));
-        registry.push(Source { id, url: r.url, title: r.title, content });
+        registry.push(Source {
+            id,
+            url: r.url,
+            title: r.title,
+            content,
+        });
     }
     Ok(())
 }
@@ -225,7 +225,11 @@ async fn main() -> Result<()> {
     let clean = cite_re.replace_all(&answer, |c: &regex::Captures| {
         let tag = &c[0];
         let id = &tag[1..tag.len() - 1]; // "[S1]" -> "S1"
-        if valid.contains(&id) { tag.to_string() } else { String::new() }
+        if valid.contains(&id) {
+            tag.to_string()
+        } else {
+            String::new()
+        }
     });
 
     // 6. Print the answer + a source list built from the real registry ------
