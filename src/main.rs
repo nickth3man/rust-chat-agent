@@ -26,7 +26,9 @@ use std::sync::LazyLock;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use answerbot::{
-    answer_prompt, answer_system_prompt, rewrite_with_anchor, strip_invalid_citations, Source,
+    answer_prompt, answer_system_prompt, has_citations, next_source_id, parse_config,
+    parse_requery, registry_contains_url, rewrite_with_anchor, strip_invalid_citations,
+    truncate_content, Config, Source,
 };
 
 const MAX_SOURCES_PER_SEARCH: usize = 4; // pages Firecrawl reads per trip
@@ -35,34 +37,13 @@ const REQUEST_TIMEOUT_SECS: u64 = 30;
 
 // ---------------------------------------------------------------------------
 // Model configuration — loaded from config/models.json at startup.
-// Secrets (API keys) stay in .env; model selection and tuning live here.
+// The Config struct and parsing live in src/lib.rs for testability.
 // ---------------------------------------------------------------------------
-#[derive(Deserialize)]
-struct Config {
-    model: String,
-    #[serde(default = "default_temperature")]
-    temperature: f64,
-    /// Whether the model supports reasoning/thinking (chain-of-thought).
-    /// When true, `reasoning: {}` is sent and reasoning is parsed from the
-    /// response. Non-reasoning models may reject unknown parameters — set
-    /// this to false for those.
-    #[serde(default = "default_true")]
-    reasoning: bool,
-}
-
-fn default_temperature() -> f64 {
-    0.7
-}
-
-fn default_true() -> bool {
-    true
-}
-
 fn load_config() -> Result<Config> {
     let path = "config/models.json";
     let contents =
         std::fs::read_to_string(path).with_context(|| format!("failed to read {path}"))?;
-    serde_json::from_str(&contents).context("failed to parse config/models.json")
+    parse_config(&contents)
 }
 
 /// Today's date in the user's local timezone as YYYY-MM-DD. Computed once per
@@ -258,16 +239,16 @@ async fn search(client: &reqwest::Client, query: &str, registry: &mut Vec<Source
 
     for r in results {
         // Dedup: skip anything we've already registered (the registry IS the set).
-        if registry.iter().any(|s| s.url == r.url) {
+        if registry_contains_url(registry, &r.url) {
             continue;
         }
         // Prefer full page text; fall back to the snippet if scraping failed.
         let mut content = r.markdown.or(r.description).unwrap_or_default();
-        content.truncate(MAX_CHARS_PER_SOURCE);
+        truncate_content(&mut content, MAX_CHARS_PER_SOURCE);
         if content.is_empty() {
             continue;
         }
-        let id = format!("S{}", registry.len() + 1);
+        let id = next_source_id(registry);
         journal(json!({ "event": "source", "id": id, "url": r.url, "query": query }));
         registry.push(Source {
             id,
@@ -351,11 +332,10 @@ async fn main() -> Result<()> {
     )
     .await?;
 
-    if let Some(new_query) = answer.strip_prefix("SEARCH:") {
-        let new_query = new_query.trim();
+    if let Some(new_query) = parse_requery(&answer) {
         eprintln!("searching again: {new_query}");
         journal(json!({ "event": "requery", "text": new_query }));
-        search(&client, new_query, &mut registry).await?;
+        search(&client, &new_query, &mut registry).await?;
         answer = llm(
             &client,
             &config,
@@ -372,7 +352,7 @@ async fn main() -> Result<()> {
     // citations. Some small/weak models (notably gpt-oss-20b) follow the
     // system prompt's content rules but ignore the citation rule entirely.
     // A single reminder re-prompt catches these without an unbounded loop.
-    if !clean.contains("[S") && !registry.is_empty() {
+    if !has_citations(&clean) && !registry.is_empty() {
         journal(json!({ "event": "no_citations_retry" }));
         eprintln!("retry: previous answer had no citations");
         let retry_prompt = format!(

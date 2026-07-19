@@ -402,3 +402,230 @@ fn rewrite_with_anchor_preserves_question_whitespace() {
 fn rewrite_with_anchor_empty_passthrough() {
     assert_eq!(rewrite_with_anchor("", "2026-07-18"), "");
 }
+
+// -- rewrite_with_anchor: substring / word-boundary false positives ----------
+
+#[test]
+fn rewrite_with_anchor_substring_recentralize_false_positive() {
+    // "recentralize" contains "recent" as a substring but is NOT a temporal
+    // query (to centralize again). This is a known false-positive pattern
+    // because the check is `lower.contains(p)` without word boundaries.
+    // The anchor is appended because "recent" triggers it.
+    let q = "Can you recentralize the database?";
+    let result = rewrite_with_anchor(q, "2026-07-18");
+    assert_eq!(
+        result,
+        "Can you recentralize the database? (as of 2026-07-18)"
+    );
+}
+
+#[test]
+fn rewrite_with_anchor_substring_unrecent_false_positive() {
+    // "unrecent" contains "recent" as a substring but means "not recent".
+    // The anchor is still appended.
+    let q = "Show me unrecent publications";
+    let result = rewrite_with_anchor(q, "2026-07-18");
+    assert_eq!(result, "Show me unrecent publications (as of 2026-07-18)");
+}
+
+#[test]
+fn rewrite_with_anchor_substring_this_yearbook() {
+    // "this yearbook" contains "this year" as a substring but is not temporal.
+    let q = "What is this yearbook about?";
+    let result = rewrite_with_anchor(q, "2026-07-18");
+    assert_eq!(result, "What is this yearbook about? (as of 2026-07-18)");
+}
+
+#[test]
+fn rewrite_with_anchor_substring_todays_anchors() {
+    // "today's" contains "today" but IS genuinely temporal — this test
+    // documents that the existing word-boundary-insensitive behaviour is
+    // intentional for common possessive forms.
+    let q = "What is today's weather?";
+    let result = rewrite_with_anchor(q, "2026-07-18");
+    assert_eq!(result, "What is today's weather? (as of 2026-07-18)");
+}
+
+#[test]
+fn rewrite_with_anchor_substring_todays_already_dated() {
+    // Even with "today's", if "as of" is present it skips anchoring.
+    let q = "today's as of right now";
+    let result = rewrite_with_anchor(q, "2026-07-18");
+    assert_eq!(result, "today's as of right now");
+}
+
+// -- answer_system_prompt: adversarial today values ------------------------
+
+#[test]
+fn answer_system_prompt_empty_today() {
+    let out = answer_system_prompt("");
+    assert!(
+        out.contains("The current date is "),
+        "empty date should still produce template with blank: {out:?}"
+    );
+}
+
+#[test]
+fn answer_system_prompt_unicode_today() {
+    let out = answer_system_prompt("2026-07-18 – ñ");
+    assert!(out.contains("2026-07-18 – ñ"));
+    // No placeholder leakage
+    assert!(!out.contains("{{current_date}}"));
+}
+
+#[test]
+fn answer_system_prompt_nested_placeholder_today() {
+    // If the substituted string itself contains the placeholder, the second
+    // occurrence should NOT be replaced (String::replace is a single pass).
+    let out = answer_system_prompt("2026-07-18 {{current_date}} extra");
+    assert!(out.contains("2026-07-18 {{current_date}} extra"));
+    // The template's {{current_date}} is gone (replaced), but the injected
+    // one survives because `replace` does a single scan left-to-right.
+    assert_eq!(out.matches("{{current_date}}").count(), 1);
+}
+
+#[test]
+fn answer_system_prompt_newline_today() {
+    let out = answer_system_prompt("2026\n07\n18");
+    assert!(out.contains("2026\n07\n18"));
+    assert!(!out.contains("{{current_date}}"));
+}
+
+#[test]
+fn answer_system_prompt_cjk_date() {
+    let out = answer_system_prompt("２０２６年０７月１８日");
+    assert!(out.contains("２０２６年０７月１８日"));
+    assert!(!out.contains("{{current_date}}"));
+}
+
+// -- strip_invalid_citations: overlapping / large IDs --------------------
+
+#[test]
+fn strip_invalid_citations_large_id_valid() {
+    let reg = [src("S100"), src("S2000")];
+    let out = must_strip("[S100] valid [S2000] also [S99] invalid", &reg);
+    assert_eq!(out, "[S100] valid [S2000] also  invalid");
+}
+
+#[test]
+fn strip_invalid_citations_prefix_independence() {
+    // S1 and S10 are independent IDs — having S10 in registry does NOT
+    // protect S1, and vice versa.
+    let reg = [src("S10")];
+    let out = must_strip("[S1] should strip [S10] kept", &reg);
+    assert_eq!(out, " should strip [S10] kept");
+}
+
+#[test]
+fn strip_invalid_citations_reverse_prefix_independence() {
+    let reg = [src("S1")];
+    let out = must_strip("[S10] should strip [S1] kept", &reg);
+    assert_eq!(out, " should strip [S1] kept");
+}
+
+#[test]
+fn strip_invalid_citations_very_large_id() {
+    let reg = [src("S999999999999999")];
+    let out = must_strip("[S999999999999999] big [S1] missing", &reg);
+    assert_eq!(out, "[S999999999999999] big  missing");
+}
+
+#[test]
+fn strip_invalid_citations_mixed_valid_chain() {
+    let reg = [src("S1"), src("S3")];
+    let out = must_strip("[S1][S2][S3][S4][S5]", &reg);
+    assert_eq!(out, "[S1][S3]");
+}
+
+#[test]
+fn strip_invalid_citations_strips_everything_when_no_match() {
+    let reg = [src("S99")];
+    let out = must_strip("[S1][S2][S3]", &reg);
+    assert_eq!(out, "");
+}
+
+// -- evidence_block: empty / Unicode fields ------------------------------
+
+#[test]
+fn evidence_block_empty_url() {
+    let s = Source {
+        id: "S1".into(),
+        title: "Title".into(),
+        url: String::new(),
+        content: "Content".into(),
+    };
+    let out = evidence_block(&[s]);
+    assert!(out.contains("[S1] Title ()"));
+}
+
+#[test]
+fn evidence_block_empty_title() {
+    let s = Source {
+        id: "S1".into(),
+        title: String::new(),
+        url: "https://x.com".into(),
+        content: "Content".into(),
+    };
+    let out = evidence_block(&[s]);
+    assert!(out.contains("[S1]  (https://x.com)"));
+}
+
+#[test]
+fn evidence_block_empty_content() {
+    let s = Source {
+        id: "S1".into(),
+        title: "Title".into(),
+        url: "https://x.com".into(),
+        content: String::new(),
+    };
+    let out = evidence_block(&[s]);
+    assert!(out.contains("[S1] Title (https://x.com)"));
+    assert!(out.contains("\n\n")); // empty content still produces trailing newline before separator
+}
+
+#[test]
+fn evidence_block_unicode_fields() {
+    let s = Source {
+        id: "S1".into(),
+        title: "日本語タイトル".into(),
+        url: "https://例子.测试/".into(),
+        content: "内容 with ñ and Arabic: مرحبا".into(),
+    };
+    let out = evidence_block(&[s]);
+    assert!(out.contains("[S1]"));
+    assert!(out.contains("日本語タイトル"));
+    assert!(out.contains("https://例子.测试/"));
+    assert!(out.contains("ñ"));
+    assert!(out.contains("مرحبا"));
+}
+
+#[test]
+fn evidence_block_content_contains_separator_text() {
+    // Content containing literal "---" should not confuse the evidence block
+    // formatting — the separator is "\n---\n" which is distinct.
+    let s = Source {
+        id: "S1".into(),
+        title: "Dashed".into(),
+        url: "https://x.com".into(),
+        content: "Some --- text --- here".into(),
+    };
+    let out = evidence_block(&[s]);
+    assert_eq!(
+        out.matches("\n---\n").count(),
+        0,
+        "single source, no separator"
+    );
+    assert!(out.contains("Some --- text --- here"));
+}
+
+#[test]
+fn evidence_block_content_with_leading_trailing_whitespace() {
+    let s = Source {
+        id: "S1".into(),
+        title: "Whitespace".into(),
+        url: "https://x.com".into(),
+        content: "  leading and trailing  ".into(),
+    };
+    let out = evidence_block(&[s]);
+    assert!(out.contains("  leading and trailing  "));
+}

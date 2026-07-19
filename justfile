@@ -33,5 +33,9 @@ test:
 run question:
     cargo run -- "{{question}}"
 
+# Run coverage (needs cargo-llvm-cov installed; reports lib.rs + extracted helpers).
+coverage:
+    cargo llvm-cov --all-targets
+
 # Everything CI runs, locally.
 ci: fmt-check lint check test deny

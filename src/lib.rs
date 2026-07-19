@@ -6,8 +6,9 @@
 // `src/main.rs` imports them and owns the orchestration: env loading, LLM
 // calls, Firecrawl calls, journaling, and printing.
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use regex::Regex;
+use serde::Deserialize;
 use std::collections::HashSet;
 
 /// One fetched page. The `id` (S1, S2, ...) is what the answer cites.
@@ -104,6 +105,72 @@ pub fn rewrite_with_anchor(question: &str, today: &str) -> String {
         format!("{question} (as of {today})")
     } else {
         question.to_string()
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Pure orchestration helpers extracted from src/main.rs so they can be
+// tested without standing up the full binary's I/O / env / network.
+// ---------------------------------------------------------------------------
+
+/// Runtime model configuration loaded from config/models.json.
+#[derive(Deserialize)]
+pub struct Config {
+    pub model: String,
+    #[serde(default = "default_temperature")]
+    pub temperature: f64,
+    /// Whether the model supports reasoning/thinking (chain-of-thought).
+    #[serde(default = "default_true")]
+    pub reasoning: bool,
+}
+
+fn default_temperature() -> f64 {
+    0.7
+}
+
+fn default_true() -> bool {
+    true
+}
+
+/// Parse a Config from raw JSON string contents (extracted from main.rs
+/// `load_config` to enable testing parser error paths / defaults).
+pub fn parse_config(contents: &str) -> Result<Config> {
+    serde_json::from_str(contents).context("failed to parse config")
+}
+
+/// Extract a re-search query from an answer that starts with `SEARCH:`.
+/// Returns `None` when the answer is not a requery request.
+pub fn parse_requery(answer: &str) -> Option<String> {
+    answer.strip_prefix("SEARCH:").map(|s| s.trim().to_string())
+}
+
+/// Check whether a URL is already in the source registry (dedup helper).
+pub fn registry_contains_url(registry: &[Source], url: &str) -> bool {
+    registry.iter().any(|s| s.url == url)
+}
+
+/// Generate the next source ID (S1, S2, …) based on the current registry length.
+pub fn next_source_id(registry: &[Source]) -> String {
+    format!("S{}", registry.len() + 1)
+}
+
+/// Check whether an answer contains at least one citation marker (`[S`).
+/// Used for the zero-citation retry gate.
+pub fn has_citations(answer: &str) -> bool {
+    answer.contains("[S")
+}
+
+/// Truncate content to at most `max` bytes, safely rounding down to the
+/// nearest UTF-8 character boundary to avoid the panic that
+/// `String::truncate` would produce when `max` lands mid-character.
+/// No-op when `max >= content.len()`.
+pub fn truncate_content(content: &mut String, max: usize) {
+    if max < content.len() {
+        let mut byte_idx = max;
+        while !content.is_char_boundary(byte_idx) {
+            byte_idx -= 1;
+        }
+        content.truncate(byte_idx);
     }
 }
 
