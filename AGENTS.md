@@ -71,3 +71,14 @@ Runtime config comes from `.env` at the repo root (loaded by `dotenvy`):
 1. `just ci` passes (fmt-check, clippy, check, deny).
 2. If behavior changed: one smoke run, e.g. `just run "what is the capital of France?"`.
 3. README updated if the flow, knobs, or env vars changed.
+
+## Cloned Dependency Source
+
+Read-only dependency source repositories are available under
+`.slim/clonedeps/repos/` for inspection. Do not edit these clones.
+
+- `.slim/clonedeps/repos/firecrawl__firecrawl/` — `firecrawl/firecrawl` at
+  `v2.11.117` (sparse-checked-out to `apps/api/src/controllers/v2/` and
+  `apps/api/src/search/v2/`); authoritative source for the `/v2/search`
+  request/response schema and handler that `answerbot`'s hand-rolled reqwest
+  client in `src/main.rs:search()` is coupled to.

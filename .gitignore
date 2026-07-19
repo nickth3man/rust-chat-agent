@@ -36,3 +36,7 @@ logs/
 journal.jsonl
 # Multi-model evaluation harness output (tests/run_eval.py writes here).
 results/
+
+# BEGIN oh-my-opencode-slim clonedeps
+.slim/
+# END oh-my-opencode-slim clonedeps
