@@ -91,6 +91,69 @@ async fn llm(client: &reqwest::Client, system: &str, user: &str) -> Result<Strin
 }
 
 // ---------------------------------------------------------------------------
+// Tool schema for the query rewrite step. Forces the model to respond with a
+// structured tool call instead of free-form prose.
+// ---------------------------------------------------------------------------
+const REWRITE_TOOL: &str = r#"{
+  "type": "function",
+  "function": {
+    "name": "generate_search_query",
+    "description": "Generate a short web search query from the user's question",
+    "parameters": {
+      "type": "object",
+      "properties": {
+        "query": {
+          "type": "string",
+          "description": "The search query (plain natural language, 1-6 words)"
+        }
+      },
+      "required": ["query"]
+    }
+  }
+}"#;
+
+/// Forced-tool-call LLM for query rewriting. Sends `tool_choice: "required"`
+/// so the model must respond with a `generate_search_query` tool call.
+/// No sentinel, no fallback \u{2014} the model returns a query or the call fails.
+async fn rewrite_llm(client: &reqwest::Client, system: &str, user: &str) -> Result<String> {
+    let key = std::env::var("OPENROUTER_API_KEY").context("OPENROUTER_API_KEY not set")?;
+    let model = std::env::var("OPENROUTER_MODEL").context("OPENROUTER_MODEL not set")?;
+    let tool_schema: Value = serde_json::from_str(REWRITE_TOOL)?;
+    let body = json!({
+        "model": model,
+        "max_tokens": 250,
+        "messages": [
+            { "role": "system", "content": system },
+            { "role": "user", "content": user }
+        ],
+        "tools": [tool_schema],
+        "tool_choice": "required"
+    });
+    let resp: Value = client
+        .post("https://openrouter.ai/api/v1/chat/completions")
+        .bearer_auth(key)
+        .json(&body)
+        .send()
+        .await?
+        .error_for_status()?
+        .json()
+        .await?;
+    let tc = resp["choices"][0]["message"]["tool_calls"]
+        .as_array()
+        .and_then(|a| a.first())
+        .context("rewrite: model did not return a tool call")?;
+    let args: Value = serde_json::from_str(
+        tc["function"]["arguments"]
+            .as_str()
+            .context("rewrite: tool call missing arguments")?,
+    )?;
+    args["query"]
+        .as_str()
+        .map(|s| s.trim().to_string())
+        .context("rewrite: tool call arguments missing 'query' field")
+}
+
+// ---------------------------------------------------------------------------
 // Firecrawl search: ONE call that both finds the top results and returns
 // each page's full text as markdown. This replaces the old search + dedupe
 // + rank + fetch stages. Docs: https://docs.firecrawl.dev
@@ -150,8 +213,23 @@ async fn search(client: &reqwest::Client, query: &str, registry: &mut Vec<Source
     Ok(())
 }
 
-const QUERY_SYSTEM: &str = "Rewrite the user's question as a short, effective web \
-search query. Reply with the query only — no quotes, no explanation.";
+const QUERY_SYSTEM: &str = "You are a search query generator. Rewrite the \
+user's question as a short, effective web search query, using the \
+`generate_search_query` tool.\n\n\
+Rules (follow every rule):\n\
+- Keep the query concise \u{2014} 1\u{2013}6 words for best results.\n\
+- Write plain natural language phrases only.\n\
+- Do NOT use search operator syntax: site:, filetype:, inurl:, \
+  intitle:, OR, AND, NOT, -, or quotation marks.\n\
+- Do NOT write sentences \u{2014} write only the query.\n\
+- Include the year for questions about recent events or dates.\n\n\
+Examples:\n\
+  Question: What is the capital of France?\n\
+  Query: capital of France\n\n\
+  Question: Latest news on the Rust Foundation\n\
+  Query: Rust Foundation news 2026\n\n\
+  Question: What is the latest version of Rust?\n\
+  Query: latest Rust version 2026";
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -185,7 +263,7 @@ async fn main() -> Result<()> {
         .build()?;
 
     // 2. Rewrite the question into one good search query -------------------
-    let query = llm(&client, QUERY_SYSTEM, &anchored).await?;
+    let query = rewrite_llm(&client, QUERY_SYSTEM, &anchored).await?;
     eprintln!("searching: {query}");
     journal(json!({ "event": "query", "text": query }));
 
