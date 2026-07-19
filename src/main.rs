@@ -9,7 +9,9 @@
 //   5. Citations pointing at sources that don't exist are stripped
 //   6. Every step is appended to journal.jsonl
 //
-// Run:  ANTHROPIC_API_KEY=... FIRECRAWL_API_KEY=... cargo run -- "your question"
+// Run:  cargo run -- "your question"
+// Config: values are read from a .env file at the project root at startup
+// (OPENROUTER_API_KEY, OPENROUTER_MODEL, FIRECRAWL_API_KEY).
 
 use anyhow::{bail, Context, Result};
 use regex::Regex;
@@ -18,7 +20,6 @@ use serde_json::{json, Value};
 use std::io::Write;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-const LLM_MODEL: &str = "claude-sonnet-4-6";
 const MAX_SOURCES_PER_SEARCH: usize = 4; // pages Firecrawl reads per trip
 const MAX_CHARS_PER_SOURCE: usize = 8_000; // truncate long pages ("safe limits")
 const REQUEST_TIMEOUT_SECS: u64 = 30;
@@ -52,28 +53,31 @@ fn journal(event: Value) {
 }
 
 // ---------------------------------------------------------------------------
-// LLM call: plain Anthropic Messages API request, returns the text reply.
-// Docs: https://docs.claude.com/en/api/overview
+// LLM call: OpenRouter chat-completions request (OpenAI-compatible), returns
+// the text reply. Docs: https://openrouter.ai/docs/api-reference/overview
 // ---------------------------------------------------------------------------
 async fn llm(client: &reqwest::Client, system: &str, user: &str) -> Result<String> {
-    let key = std::env::var("ANTHROPIC_API_KEY").context("ANTHROPIC_API_KEY not set")?;
+    let key = std::env::var("OPENROUTER_API_KEY").context("OPENROUTER_API_KEY not set")?;
+    let model =
+        std::env::var("OPENROUTER_MODEL").context("OPENROUTER_MODEL not set")?;
     let body = json!({
-        "model": LLM_MODEL,
+        "model": model,
         "max_tokens": 1500,
-        "system": system,
-        "messages": [{ "role": "user", "content": user }]
+        "messages": [
+            { "role": "system", "content": system },
+            { "role": "user", "content": user }
+        ]
     });
     let resp: Value = client
-        .post("https://api.anthropic.com/v1/messages")
-        .header("x-api-key", key)
-        .header("anthropic-version", "2023-06-01")
+        .post("https://openrouter.ai/api/v1/chat/completions")
+        .bearer_auth(key)
         .json(&body)
         .send()
         .await?
         .error_for_status()?
         .json()
         .await?;
-    let text = resp["content"][0]["text"]
+    let text = resp["choices"][0]["message"]["content"]
         .as_str()
         .context("no text in LLM response")?
         .trim()
@@ -157,6 +161,15 @@ answer directly. Never invent sources.";
 
 #[tokio::main]
 async fn main() -> Result<()> {
+    // Load .env from the project root into the process environment. Missing
+    // file is fine (variables may already be set in the shell); a present but
+    // malformed file is a real error.
+    match dotenvy::dotenv() {
+        Ok(_) => {}
+        Err(e) if e.not_found() => {}
+        Err(e) => return Err(e).context("failed to load .env"),
+    }
+
     // 1. You ask -----------------------------------------------------------
     let question: String = std::env::args().skip(1).collect::<Vec<_>>().join(" ");
     if question.is_empty() {

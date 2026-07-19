@@ -41,6 +41,4 @@ cargo run --release -- "what changed in the latest Rust edition?"
 
 - **Streaming output**: switch the final `llm()` call to the Messages API
   streaming mode and print tokens as they arrive.
-- **Academic depth**: add an arXiv search function and let the answer prompt
-  choose between it and Firecrawl.
 - **More depth per question**: raise the re-search cap from 1 to 2.
