@@ -46,10 +46,7 @@ fn load_config() -> Result<Config> {
     parse_config(&contents)
 }
 
-/// Today's date in the user's local timezone as YYYY-MM-DD. Computed once per
-/// process — this binary is single-shot per `cargo run`, so per-call refresh
-/// buys nothing and would invalidate prompt-cache prefixes that the LLM
-/// provider may otherwise share across sessions.
+/// Today's date in the user's local timezone as YYYY-MM-DD.
 static TODAY: LazyLock<String> =
     LazyLock::new(|| chrono::Local::now().format("%Y-%m-%d").to_string());
 
@@ -168,7 +165,6 @@ const REWRITE_TOOL: &str = r#"{
 
 /// Forced-tool-call LLM for query rewriting. Sends `tool_choice: "required"`
 /// so the model must respond with a `generate_search_query` tool call.
-/// No sentinel, no fallback \u{2014} the model returns a query or the call fails.
 async fn rewrite_llm(
     client: &reqwest::Client,
     config: &Config,
@@ -346,9 +342,7 @@ async fn main() -> Result<()> {
     let mut clean = strip_invalid_citations(&answer, &registry)?;
 
     // 5b. One retry if the model produced a correct-looking answer with zero
-    // citations. Some small/weak models (notably gpt-oss-20b) follow the
-    // system prompt's content rules but ignore the citation rule entirely.
-    // A single reminder re-prompt catches these without an unbounded loop.
+    // citations (small models sometimes ignore the citation rule).
     if !has_citations(&clean) && !registry.is_empty() {
         journal(json!({ "event": "no_citations_retry" }));
         eprintln!("retry: previous answer had no citations");

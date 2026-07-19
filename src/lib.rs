@@ -62,16 +62,12 @@ pub fn answer_prompt(question: &str, registry: &[Source], insist: bool) -> Strin
 }
 
 // ---------------------------------------------------------------------------
-// Temporal anchor helpers (Option #6 implementation). See the plan in
-// the conversation or the README for design rationale.
+// Temporal anchor helpers
 // ---------------------------------------------------------------------------
 
-/// Phrases that imply a relative-time anchor. When any are present
-/// (case-insensitive) and the question does not already contain "as of",
-/// `rewrite_with_anchor` suffixes the question with `(as of <today>)` so the
-/// search-rewrite step has a concrete date to relativize "latest", "recent",
-/// etc. against. Conservative list — common false positives ("current" as in
-/// "current directory", "this week's weather", etc.) are deliberately omitted.
+/// Phrases that imply a relative-time anchor. When any are present and the
+/// question does not already contain "as of", `rewrite_with_anchor` suffixes
+/// the question with `(as of <today>)`.
 const ANCHOR_PHRASES: &[&str] = &[
     "latest",
     "recent",
@@ -86,8 +82,7 @@ const ANCHOR_PHRASES: &[&str] = &[
 ];
 
 /// Render the answering system prompt with the current date injected into
-/// the `{{current_date}}` placeholder. Mirrors the `FastChat` convention:
-/// per-render substitution of a placeholder in a static template.
+/// the `{{current_date}}` placeholder.
 pub fn answer_system_prompt(today: &str) -> String {
     ANSWER_SYSTEM_TEMPLATE.replace("{{current_date}}", today)
 }
@@ -109,8 +104,7 @@ pub fn rewrite_with_anchor(question: &str, today: &str) -> String {
 }
 
 // ---------------------------------------------------------------------------
-// Pure orchestration helpers extracted from src/main.rs so they can be
-// tested without standing up the full binary's I/O / env / network.
+// Orchestration helpers
 // ---------------------------------------------------------------------------
 
 /// Runtime model configuration loaded from config/models.json.
@@ -132,8 +126,7 @@ fn default_true() -> bool {
     true
 }
 
-/// Parse a Config from raw JSON string contents (extracted from main.rs
-/// `load_config` to enable testing parser error paths / defaults).
+/// Parse a Config from raw JSON string contents.
 pub fn parse_config(contents: &str) -> Result<Config> {
     serde_json::from_str(contents).context("failed to parse config")
 }
