@@ -1,0 +1,6 @@
+# Stable options only — unstable ones fail on the stable toolchain.
+use_field_init_shorthand = true
+
+# Unstable — enable when stabilized (rust-lang/rustfmt#5083):
+# group_imports = "StdExternalCrate"
+# imports_granularity = "Module"

@@ -48,7 +48,7 @@ fn journal(mut event: Value) {
         .append(true)
         .open("journal.jsonl")
     {
-        let _ = writeln!(f, "{}", event);
+        let _ = writeln!(f, "{event}");
     }
 }
 

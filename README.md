@@ -10,13 +10,15 @@ and every step lands in `journal.jsonl`.
 
 1. Install Rust: https://rustup.rs
 2. Get two API keys:
-   - Anthropic: https://console.anthropic.com
+   - OpenRouter: https://openrouter.ai
    - Firecrawl: https://firecrawl.dev
-3. Run:
+3. Copy `.env.example` to `.env` and fill in:
+   - `OPENROUTER_API_KEY`
+   - `OPENROUTER_MODEL` (e.g. `anthropic/claude-sonnet-4.5`)
+   - `FIRECRAWL_API_KEY`
+4. Run:
 
 ```bash
-export ANTHROPIC_API_KEY=sk-ant-...
-export FIRECRAWL_API_KEY=fc-...
 cargo run --release -- "what changed in the latest Rust edition?"
 ```
 
@@ -36,6 +38,30 @@ cargo run --release -- "what changed in the latest Rust edition?"
 - `MAX_SOURCES_PER_SEARCH` — pages read per trip (default 4)
 - `MAX_CHARS_PER_SOURCE` — truncation limit per page (default 8,000)
 - `REQUEST_TIMEOUT_SECS` — hard cap per network call (default 30)
+
+## Development
+
+One-time tool install:
+
+```bash
+cargo install --locked just cargo-deny
+```
+
+Common tasks (see `justfile`):
+
+```bash
+just fmt        # format
+just lint       # clippy, warnings are errors
+just check      # type-check against Cargo.lock
+just deny       # dependency advisories + license audit
+just ci         # everything CI runs
+just run "..."  # ask a question
+```
+
+Lints live in `Cargo.toml` under `[lints]` (clippy `all` + `pedantic` as
+warnings); CI denies warnings, so keep `just lint` clean. Formatting is
+rustfmt defaults plus `rustfmt.toml`. CI (`.github/workflows/ci.yml`) runs
+fmt-check, clippy, check, and cargo-deny on every push and PR.
 
 ## Upgrade paths (when you need them, not before)
 

@@ -13,7 +13,10 @@
 !.env.example
 
 # --- Editors / IDEs ---
-.vscode/
+# Shared editor config is tracked; everything else in .vscode/ is personal.
+.vscode/*
+!.vscode/settings.json
+!.vscode/extensions.json
 .idea/
 *.iml
 *.swp
@@ -29,3 +32,5 @@ desktop.ini
 # --- Logs / runtime artifacts ---
 *.log
 logs/
+# Append-only audit trail written by every run.
+journal.jsonl
