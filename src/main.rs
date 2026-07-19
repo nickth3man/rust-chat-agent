@@ -17,6 +17,7 @@ use anyhow::{bail, Context, Result};
 use regex::Regex;
 use serde::Deserialize;
 use serde_json::{json, Value};
+use std::collections::HashSet;
 use std::io::Write;
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -36,19 +37,18 @@ struct Source {
 // The journal: one JSON line per event. This single file is the audit trail,
 // the dedup record, and the citation registry's paper trail all at once.
 // ---------------------------------------------------------------------------
-fn journal(event: Value) {
+fn journal(mut event: Value) {
     let ts = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_secs())
         .unwrap_or(0);
-    let mut line = event;
-    line["ts"] = json!(ts);
+    event["ts"] = json!(ts);
     if let Ok(mut f) = std::fs::OpenOptions::new()
         .create(true)
         .append(true)
         .open("journal.jsonl")
     {
-        let _ = writeln!(f, "{}", line);
+        let _ = writeln!(f, "{}", event);
     }
 }
 
@@ -153,21 +153,38 @@ fn evidence_block(registry: &[Source]) -> String {
         .join("\n---\n")
 }
 
+/// Build the prompt sent to the answering LLM. `insist` adds the "you must
+/// answer now" suffix used after a re-search.
+fn answer_prompt(question: &str, registry: &[Source], insist: bool) -> String {
+    let suffix = if insist {
+        "\n\nYou must answer now using the sources above. Do not request another search."
+    } else {
+        ""
+    };
+    format!(
+        "Question: {question}\n\nSources:\n{}{suffix}",
+        evidence_block(registry)
+    )
+}
+
 const ANSWER_SYSTEM: &str = "You are a research assistant. Answer the user's question \
 using ONLY the provided sources. Cite every factual claim with its source id in \
 brackets, e.g. [S1]. If — and only if — the sources genuinely cannot answer the \
 question, reply with exactly one line: SEARCH: <a better search query>. Otherwise, \
 answer directly. Never invent sources.";
 
+const QUERY_SYSTEM: &str = "Rewrite the user's question as a short, effective web \
+search query. Reply with the query only — no quotes, no explanation.";
+
 #[tokio::main]
 async fn main() -> Result<()> {
     // Load .env from the project root into the process environment. Missing
     // file is fine (variables may already be set in the shell); a present but
     // malformed file is a real error.
-    match dotenvy::dotenv() {
-        Ok(_) => {}
-        Err(e) if e.not_found() => {}
-        Err(e) => return Err(e).context("failed to load .env"),
+    if let Err(e) = dotenvy::dotenv() {
+        if !e.not_found() {
+            return Err(e).context("failed to load .env");
+        }
     }
 
     // 1. You ask -----------------------------------------------------------
@@ -182,13 +199,7 @@ async fn main() -> Result<()> {
         .build()?;
 
     // 2. Rewrite the question into one good search query -------------------
-    let query = llm(
-        &client,
-        "Rewrite the user's question as a short, effective web search query. \
-         Reply with the query only — no quotes, no explanation.",
-        &question,
-    )
-    .await?;
+    let query = llm(&client, QUERY_SYSTEM, &question).await?;
     eprintln!("searching: {query}");
     journal(json!({ "event": "query", "text": query }));
 
@@ -200,32 +211,33 @@ async fn main() -> Result<()> {
     }
 
     // 4. Answer — with exactly one re-search allowed ------------------------
-    let prompt = format!(
-        "Question: {question}\n\nSources:\n{}",
-        evidence_block(&registry)
-    );
-    let mut answer = llm(&client, ANSWER_SYSTEM, &prompt).await?;
+    let mut answer = llm(
+        &client,
+        ANSWER_SYSTEM,
+        &answer_prompt(&question, &registry, false),
+    )
+    .await?;
 
     if let Some(new_query) = answer.strip_prefix("SEARCH:") {
-        let new_query = new_query.trim().to_string();
+        let new_query = new_query.trim();
         eprintln!("searching again: {new_query}");
         journal(json!({ "event": "requery", "text": new_query }));
-        search(&client, &new_query, &mut registry).await?;
-        let prompt = format!(
-            "Question: {question}\n\nSources:\n{}\n\nYou must answer now using \
-             the sources above. Do not request another search.",
-            evidence_block(&registry)
-        );
-        answer = llm(&client, ANSWER_SYSTEM, &prompt).await?;
+        search(&client, new_query, &mut registry).await?;
+        answer = llm(
+            &client,
+            ANSWER_SYSTEM,
+            &answer_prompt(&question, &registry, true),
+        )
+        .await?;
     }
 
     // 5. Honest citations: strip any [Sn] that isn't a real source ----------
     let cite_re = Regex::new(r"\[S\d+\]")?;
-    let valid: Vec<&str> = registry.iter().map(|s| s.id.as_str()).collect();
+    let valid: HashSet<&str> = registry.iter().map(|s| s.id.as_str()).collect();
     let clean = cite_re.replace_all(&answer, |c: &regex::Captures| {
         let tag = &c[0];
         let id = &tag[1..tag.len() - 1]; // "[S1]" -> "S1"
-        if valid.contains(&id) {
+        if valid.contains(id) {
             tag.to_string()
         } else {
             String::new()
