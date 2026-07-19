@@ -7,15 +7,15 @@ Guidance for AI coding agents working in this repository.
 `answerbot` — a single-binary Rust CLI that answers a question by (1) asking an
 LLM (via OpenRouter) to rewrite it into a search query, (2) searching + reading
 pages with Firecrawl, and (3) answering with `[S1]`-style citations that are
-validated against the actually-fetched sources. The entire program lives in
-[src/main.rs](src/main.rs); [README.md](README.md) maps each flow step to the
-code.
+validated against the actually-fetched sources. The orchestration (env loading,
+LLM/Firecrawl calls, journaling, printing) lives in [src/main.rs](src/main.rs);
+the pure LLM-facing helpers (`Source`, prompt formatting, citation validation)
+live in [src/lib.rs](src/lib.rs). [README.md](README.md) maps each flow step to
+the code.
 
 Deliberate design constraints (do not "fix" these without being asked):
 
-- **One file.** The whole system stays in `src/main.rs`. Don't split into
-  modules or a lib crate unless the task explicitly calls for it.
-- **One re-search.** The answer loop allows exactly one `SEARCH:` retry.
+- **One re-search.** The answer loop allows exactly one `SEARCH:` retry, enforced structurally by the `SEARCH:` branch in `src/main.rs` (no inner loop) and in the prompt by the `insist=true` suffix that `answer_prompt` in `src/lib.rs` appends on the second call.
 - **Everything journaled.** Every step appends a JSON line to `journal.jsonl`
   (gitignored runtime artifact — never commit it).
 
@@ -32,8 +32,8 @@ Tooling: `cargo install --locked just cargo-deny` (one-time).
 | Everything CI runs | `just ci` |
 | Ask a question | `just run "your question"` |
 
-No tests exist yet (intentional). If you add some, uncomment the test step in
-[.github/workflows/ci.yml](.github/workflows/ci.yml).
+Tests live in `tests/` as integration tests against the helpers in
+`src/lib.rs`. CI runs `cargo test --locked` on every push and PR.
 
 ## Conventions
 

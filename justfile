@@ -25,9 +25,13 @@ check:
 deny:
     cargo deny check
 
+# Run tests against the committed lockfile.
+test:
+    cargo test --locked
+
 # Ask a question, e.g.:  just run "what is rust?"
 run question:
     cargo run -- "{{question}}"
 
 # Everything CI runs, locally.
-ci: fmt-check lint check deny
+ci: fmt-check lint check test deny

@@ -1,6 +1,11 @@
-// answerbot — the whole system in one file.
+// answerbot — research agent CLI.
 //
-// Flow (matches the diagram):
+// The orchestration (env loading, LLM/Firecrawl calls, journaling, printing)
+// lives here. The pure LLM-facing helpers (Source, prompt formatting, citation
+// validation) live in `src/lib.rs` and are exercised by integration tests in
+// `tests/`.
+//
+// Flow (matches the diagram in README.md):
 //   1. You ask a question
 //   2. The AI rewrites it into one good search query   (LLM call #1)
 //   3. Firecrawl searches AND reads the top pages in one trip
@@ -14,24 +19,16 @@
 // (OPENROUTER_API_KEY, OPENROUTER_MODEL, FIRECRAWL_API_KEY).
 
 use anyhow::{bail, Context, Result};
-use regex::Regex;
 use serde::Deserialize;
 use serde_json::{json, Value};
-use std::collections::HashSet;
 use std::io::Write;
 use std::time::{SystemTime, UNIX_EPOCH};
+
+use answerbot::{answer_prompt, strip_invalid_citations, Source};
 
 const MAX_SOURCES_PER_SEARCH: usize = 4; // pages Firecrawl reads per trip
 const MAX_CHARS_PER_SOURCE: usize = 8_000; // truncate long pages ("safe limits")
 const REQUEST_TIMEOUT_SECS: u64 = 30;
-
-/// One fetched page. The `id` (S1, S2, ...) is what the answer cites.
-struct Source {
-    id: String,
-    url: String,
-    title: String,
-    content: String,
-}
 
 // ---------------------------------------------------------------------------
 // The journal: one JSON line per event. This single file is the audit trail,
@@ -143,29 +140,6 @@ async fn search(client: &reqwest::Client, query: &str, registry: &mut Vec<Source
     Ok(())
 }
 
-/// Format the registry into the evidence block the AI reads before answering.
-fn evidence_block(registry: &[Source]) -> String {
-    registry
-        .iter()
-        .map(|s| format!("[{}] {} ({})\n{}\n", s.id, s.title, s.url, s.content))
-        .collect::<Vec<_>>()
-        .join("\n---\n")
-}
-
-/// Build the prompt sent to the answering LLM. `insist` adds the "you must
-/// answer now" suffix used after a re-search.
-fn answer_prompt(question: &str, registry: &[Source], insist: bool) -> String {
-    let suffix = if insist {
-        "\n\nYou must answer now using the sources above. Do not request another search."
-    } else {
-        ""
-    };
-    format!(
-        "Question: {question}\n\nSources:\n{}{suffix}",
-        evidence_block(registry)
-    )
-}
-
 const ANSWER_SYSTEM: &str = "You are a research assistant. Answer the user's question \
 using ONLY the provided sources. Cite every factual claim with its source id in \
 brackets, e.g. [S1]. If — and only if — the sources genuinely cannot answer the \
@@ -231,17 +205,7 @@ async fn main() -> Result<()> {
     }
 
     // 5. Honest citations: strip any [Sn] that isn't a real source ----------
-    let cite_re = Regex::new(r"\[S\d+\]")?;
-    let valid: HashSet<&str> = registry.iter().map(|s| s.id.as_str()).collect();
-    let clean = cite_re.replace_all(&answer, |c: &regex::Captures| {
-        let tag = &c[0];
-        let id = &tag[1..tag.len() - 1]; // "[S1]" -> "S1"
-        if valid.contains(id) {
-            tag.to_string()
-        } else {
-            String::new()
-        }
-    });
+    let clean = strip_invalid_citations(&answer, &registry)?;
 
     // 6. Print the answer + a source list built from the real registry ------
     println!("\n{clean}\n\nSources:");
@@ -250,6 +214,6 @@ async fn main() -> Result<()> {
             println!("  [{}] {} — {}", s.id, s.title, s.url);
         }
     }
-    journal(json!({ "event": "answer", "text": clean.to_string() }));
+    journal(json!({ "event": "answer", "text": clean }));
     Ok(())
 }

@@ -31,9 +31,8 @@ jobs:
       - name: Check
         run: cargo check --locked
 
-      # Uncomment when tests exist:
-      # - name: Test
-      #   run: cargo test --locked
+      - name: Test
+        run: cargo test --locked
 
   deny:
     name: cargo-deny
