@@ -3,8 +3,9 @@
 // truncate_content.
 
 use answerbot::{
-    extract_answer_text, has_citations, next_source_id, parse_config, parse_requery,
-    registry_contains_url, truncate_content,
+    extract_answer_text, has_citations, next_source_id, parse_config, parse_firecrawl_web,
+    parse_requery, parse_rewrite_query_arg, registry_contains_url, should_reject_late_requery,
+    truncate_content, FirecrawlWebResult, RewriteQueryReject,
 };
 mod common;
 
@@ -152,6 +153,83 @@ fn parse_requery_preserves_query_content_verbatim() {
     // The extracted query retains punctuation, Unicode, etc.
     let q = "SEARCH: What's the latest? (2026)";
     assert_eq!(parse_requery(q), Some("What's the latest? (2026)".into()),);
+}
+
+// -- should_reject_late_requery: post-insist SEARCH: guard -----------------
+
+#[test]
+fn should_reject_late_requery_true_for_valid_search() {
+    assert!(should_reject_late_requery("SEARCH: better query"));
+}
+
+#[test]
+fn should_reject_late_requery_false_for_normal_answer() {
+    assert!(!should_reject_late_requery("Paris is the capital [S1]"));
+}
+
+#[test]
+fn should_reject_late_requery_false_for_blank_search() {
+    // Empty/whitespace-only requeries are not actionable SEARCH: lines.
+    assert!(!should_reject_late_requery("SEARCH:"));
+    assert!(!should_reject_late_requery("SEARCH:   "));
+}
+
+#[test]
+fn should_reject_late_requery_false_when_embedded() {
+    assert!(!should_reject_late_requery("Do SEARCH: again"));
+}
+
+// -- parse_rewrite_query_arg: tool-call query extraction -------------------
+
+#[test]
+fn parse_rewrite_query_arg_happy_path() {
+    let args = serde_json::json!({ "query": "  rust edition  " });
+    assert_eq!(parse_rewrite_query_arg(&args).unwrap(), "rust edition");
+}
+
+#[test]
+fn parse_rewrite_query_arg_missing_field() {
+    let args = serde_json::json!({ "other": "x" });
+    assert_eq!(
+        parse_rewrite_query_arg(&args).unwrap_err(),
+        RewriteQueryReject::Missing
+    );
+}
+
+#[test]
+fn parse_rewrite_query_arg_null_is_missing() {
+    let args = serde_json::json!({ "query": null });
+    assert_eq!(
+        parse_rewrite_query_arg(&args).unwrap_err(),
+        RewriteQueryReject::Missing
+    );
+}
+
+#[test]
+fn parse_rewrite_query_arg_non_string_is_missing() {
+    let args = serde_json::json!({ "query": 42 });
+    assert_eq!(
+        parse_rewrite_query_arg(&args).unwrap_err(),
+        RewriteQueryReject::Missing
+    );
+}
+
+#[test]
+fn parse_rewrite_query_arg_empty_is_empty() {
+    let args = serde_json::json!({ "query": "" });
+    assert_eq!(
+        parse_rewrite_query_arg(&args).unwrap_err(),
+        RewriteQueryReject::Empty
+    );
+}
+
+#[test]
+fn parse_rewrite_query_arg_whitespace_is_empty() {
+    let args = serde_json::json!({ "query": "   \t  " });
+    assert_eq!(
+        parse_rewrite_query_arg(&args).unwrap_err(),
+        RewriteQueryReject::Empty
+    );
 }
 
 // -- registry_contains_url: dedup helper -----------------------------------
@@ -343,4 +421,87 @@ fn truncate_content_four_byte_char_boundary() {
     let mut s = "𐍈hello".to_string();
     truncate_content(&mut s, 4); // exactly at the 𐍈 boundary
     assert_eq!(s, "𐍈", "4 bytes is exactly the 4-byte char boundary");
+}
+
+// -- parse_firecrawl_web: /v2/search data.web shape ------------------------
+
+#[test]
+fn parse_firecrawl_web_happy_path() {
+    let resp = serde_json::json!({
+        "data": {
+            "web": [
+                {
+                    "url": "https://example.com",
+                    "title": "Example",
+                    "markdown": "# Hello",
+                    "description": "snippet"
+                }
+            ]
+        }
+    });
+    let results = parse_firecrawl_web(&resp).expect("happy path must parse");
+    assert_eq!(
+        results,
+        vec![FirecrawlWebResult {
+            url: "https://example.com".into(),
+            title: "Example".into(),
+            markdown: Some("# Hello".into()),
+            description: Some("snippet".into()),
+        }]
+    );
+}
+
+#[test]
+fn parse_firecrawl_web_empty_array_is_ok() {
+    let resp = serde_json::json!({ "data": { "web": [] } });
+    let results = parse_firecrawl_web(&resp).expect("empty web array is valid");
+    assert!(results.is_empty());
+}
+
+#[test]
+fn parse_firecrawl_web_missing_data_web_is_error() {
+    let resp = serde_json::json!({ "data": {} });
+    let err = parse_firecrawl_web(&resp).expect_err("missing web must error");
+    assert!(
+        err.to_string().contains("missing or null data.web"),
+        "unexpected error: {err}"
+    );
+}
+
+#[test]
+fn parse_firecrawl_web_null_web_is_error() {
+    let resp = serde_json::json!({ "data": { "web": null } });
+    let err = parse_firecrawl_web(&resp).expect_err("null web must error");
+    assert!(
+        err.to_string().contains("missing or null data.web"),
+        "unexpected error: {err}"
+    );
+}
+
+#[test]
+fn parse_firecrawl_web_bad_entry_shape_is_error() {
+    // url is required; a number is the wrong type.
+    let resp = serde_json::json!({
+        "data": { "web": [ { "url": 123 } ] }
+    });
+    let err = parse_firecrawl_web(&resp).expect_err("bad entry must error");
+    assert!(
+        err.to_string().contains("failed to deserialize"),
+        "unexpected error: {err}"
+    );
+}
+
+#[test]
+fn parse_firecrawl_web_defaults_optional_fields() {
+    let resp = serde_json::json!({
+        "data": {
+            "web": [ { "url": "https://a.com" } ]
+        }
+    });
+    let results = parse_firecrawl_web(&resp).expect("url-only entry must parse");
+    assert_eq!(results.len(), 1);
+    assert_eq!(results[0].url, "https://a.com");
+    assert_eq!(results[0].title, "");
+    assert_eq!(results[0].markdown, None);
+    assert_eq!(results[0].description, None);
 }

@@ -15,7 +15,8 @@ and every step lands in `journal.jsonl`.
 3. Copy `.env.example` to `.env` and fill in:
     - `OPENROUTER_API_KEY`
     - `FIRECRAWL_API_KEY`
-4. Choose a model in `config/models.json` (model name and temperature).
+4. Copy `config/models.json.example` to `config/models.json` and choose a
+   model (model name and temperature). The real file is gitignored.
 5. Run:
 
 ```bash
@@ -27,19 +28,30 @@ cargo run --release -- "what changed in the latest Rust edition?"
 | Flow step | Where in `src/main.rs` |
 |---|---|
 | You ask | `main()` reads the command line |
-| AI writes one search query | first `llm()` call |
+| AI writes one search query | `rewrite_llm()` (forced `generate_search_query` tool) |
 | Firecrawl finds + reads pages in one trip | `search()` |
-| One re-search allowed if needed | the `SEARCH:` branch |
+| AI answers from sources | `llm()` (plain chat — no tools) |
+| One re-search allowed if needed | answer text starts with `SEARCH:` → host runs `search()` again |
 | Citations kept honest | the regex strip near the end |
-| Everything noted in one file | `journal()` → `journal.jsonl` |
+| Everything noted in one file | `journal()` → `journal.jsonl` (or `ANSWERBOT_JOURNAL`) |
+
+There are two different “search” mechanisms:
+
+- **Rewrite step** — the only OpenRouter tool call: `generate_search_query`,
+  forced via `tool_choice: "required"`. It returns a short query string; it
+  does not fetch the web.
+- **Answer step** — no tools. If sources are insufficient, the model replies
+  with exactly `SEARCH: <query>`; the host parses that line and calls
+  Firecrawl once more (then re-asks with `insist=true`).
 
 ## Configuration
 
-Model selection and tuning live in `config/models.json`:
+Model selection and tuning live in `config/models.json` (gitignored local
+file — copy from `config/models.json.example`; there is no built-in default):
 
 ```json
 {
-  "model": "openai/gpt-oss-20b",
+  "model": "your-openrouter-model-id",
   "temperature": 0.7,
   "reasoning": true
 }
@@ -52,7 +64,15 @@ Model selection and tuning live in `config/models.json`:
   non-reasoning models** — some providers (e.g. Mistral via Cloudflare) reject
   the unknown parameter with HTTP 400.
 
-Secrets (API keys) stay in `.env`.
+The compatibility table below is a tested set, not a recommended default.
+
+Secrets (API keys) stay in `.env`. Optional path overrides (CWD-relative unless
+absolute):
+
+- `ANSWERBOT_CONFIG` — models JSON (default `config/models.json`)
+- `ANSWERBOT_JOURNAL` — journal file (default `journal.jsonl`)
+
+Run from the repo root, or set these when the CWD differs.
 
 ## Model compatibility
 
@@ -65,19 +85,22 @@ Tested against four OpenRouter models at under ~$0.20/1M tokens:
 | `mistralai/mistral-small-3.2-24b-instruct` | no        | ~5.1 avg             | requires `reasoning: false`   |
 | `meta-llama/llama-4-scout`                 | no        | ~4.3 avg             | requires `reasoning: false`   |
 
-The answer loop has one zero-citation retry built in (`src/main.rs:368-388`):
-if the model's first answer has no `[Sn]` citations despite having sources
-available, it is re-prompted with a citation reminder. This catches
-instruction-following gaps in smaller reasoning models. The retry is bounded —
-exactly one, same as the `SEARCH:` re-search limit — to keep the structural
-constraints from AGENTS.md intact.
+The answer loop has one zero-citation retry built in near the end of `main`
+in `src/main.rs`: if the model's first answer has no `[Sn]` citations despite
+having sources available, it is re-prompted with a citation reminder. This
+catches instruction-following gaps in smaller reasoning models. The retry is
+bounded — exactly one, same as the `SEARCH:` re-search limit — to keep the
+structural constraints from AGENTS.md intact. A late `SEARCH:` after the one
+allowed re-search is rejected *before* this citation retry (so it does not
+waste an LLM call), and again after the retry if that path also returns
+`SEARCH:`.
 
 Three bounded retry loops catch weaker-model failure modes:
 
 - `rewrite_llm` retries up to `REWRITE_MAX_ATTEMPTS` times when the rewrite
-  step emits no tool call, malformed arguments, or a missing `query` field.
-  `openai/gpt-oss-20b` occasionally refuses the forced tool call on
-  historical questions; the retry absorbs that without operator action.
+  step emits no tool call, malformed arguments, a missing `query` field, or
+  a blank `query`. `openai/gpt-oss-20b` occasionally refuses the forced tool
+  call on historical questions; the retry absorbs that without operator action.
 - `llm` retries up to `LLM_MAX_ATTEMPTS` times when the answer comes back
   with empty `content` — common for reasoning models that finish their
   chain-of-thought but emit no final answer.
@@ -98,6 +121,9 @@ exponential backoff (`backoff_ms` in `src/lib.rs`: 250, 500, 1000, 2000,
 - `REWRITE_MAX_ATTEMPTS` — total attempts at the rewrite tool call (default 5)
 - `LLM_MAX_ATTEMPTS` — total attempts at the answering call (default 3)
 - `NETWORK_MAX_ATTEMPTS` — total attempts at each HTTP POST (default 3)
+
+`journal.jsonl` (override with `ANSWERBOT_JOURNAL`) appends full questions,
+queries, reasoning, and answers — treat it as sensitive local data.
 
 `REQUEST_TIMEOUT_SECS` bounds a single HTTP call, not the whole run. With
 retries enabled, each HTTP attempt can take up to three timeouts plus the

@@ -48,6 +48,10 @@ def run_one(model: str, qid: int, question: str) -> dict:
         journal_path.unlink()
 
     start = time.time()
+    # Outer timeout is intentional for *typical* runs (well under a minute).
+    # Worst-case answerbot runs with every retry exhausted can take ~20–25
+    # minutes (see README Knobs). Slow models on the stacked-retry path will
+    # hit this outer limit — that is expected, not a per-call timeout bug.
     result = subprocess.run(
         ["cargo", "run", "--", question],
         cwd=ROOT,

@@ -29,8 +29,9 @@ use tokio::time::sleep;
 
 use answerbot::{
     answer_prompt, answer_system_prompt, extract_answer_text, has_citations, is_retryable_status,
-    next_source_id, parse_config, parse_requery, registry_contains_url, rewrite_with_anchor,
-    strip_invalid_citations, truncate_content, Config, Source,
+    next_source_id, parse_config, parse_firecrawl_web, parse_requery, parse_rewrite_query_arg,
+    query_system_prompt, registry_contains_url, rewrite_with_anchor, should_reject_late_requery,
+    strip_invalid_citations, truncate_content, Config, RewriteQueryReject, Source,
 };
 
 const MAX_SOURCES_PER_SEARCH: usize = 4; // pages Firecrawl reads per trip
@@ -46,14 +47,31 @@ const NETWORK_MAX_ATTEMPTS: u32 = 3;
 const REWRITE_MAX_ATTEMPTS: u32 = 5;
 const LLM_MAX_ATTEMPTS: u32 = 3;
 
+const DEFAULT_CONFIG_PATH: &str = "config/models.json";
+const DEFAULT_JOURNAL_PATH: &str = "journal.jsonl";
+
 // ---------------------------------------------------------------------------
 // Model configuration — loaded from config/models.json at startup.
-// The Config struct and parsing live in src/lib.rs for testability.
+// Path override: ANSWERBOT_CONFIG. The Config struct and parsing live in
+// src/lib.rs for testability.
 // ---------------------------------------------------------------------------
+fn env_path(var: &str, default: &str) -> String {
+    std::env::var(var).unwrap_or_else(|_| default.to_string())
+}
+
+fn config_path() -> String {
+    env_path("ANSWERBOT_CONFIG", DEFAULT_CONFIG_PATH)
+}
+
+fn journal_path() -> String {
+    env_path("ANSWERBOT_JOURNAL", DEFAULT_JOURNAL_PATH)
+}
+
 fn load_config() -> Result<Config> {
-    let path = "config/models.json";
-    let contents =
-        std::fs::read_to_string(path).with_context(|| format!("failed to read {path}"))?;
+    let path = config_path();
+    let contents = std::fs::read_to_string(&path).with_context(|| {
+        format!("failed to read {path} (set ANSWERBOT_CONFIG or run from the repo root)")
+    })?;
     parse_config(&contents)
 }
 
@@ -80,18 +98,35 @@ fn journal(mut event: Value) {
     // AGENTS.md declares "everything journaled" a design constraint. Surface
     // open/write failures on stderr so silent journal loss is at least
     // observable to the operator; do not abort the run.
+    let path = journal_path();
     match std::fs::OpenOptions::new()
         .create(true)
         .append(true)
-        .open("journal.jsonl")
+        .open(&path)
     {
         Ok(mut f) => {
             if let Err(e) = writeln!(f, "{event}") {
-                eprintln!("warning: journal write failed: {e}");
+                eprintln!("warning: journal write failed ({path}): {e}");
             }
         }
-        Err(e) => eprintln!("warning: could not open journal.jsonl: {e}"),
+        Err(e) => eprintln!("warning: could not open {path}: {e}"),
     }
+}
+
+/// Journal a retry event and sleep for the backoff of the prior attempt.
+/// `attempt` is 1-based (matches journal fields). Used by the LLM/rewrite
+/// loops; `post_json` journals an extra `url` field then calls `sleep_backoff`.
+async fn journal_retry_and_sleep(event: &str, attempt: u32, reason: &str) {
+    journal(json!({
+        "event": event,
+        "attempt": attempt,
+        "reason": reason,
+    }));
+    sleep_backoff(attempt.saturating_sub(1)).await;
+}
+
+async fn sleep_backoff(attempt_0based: u32) {
+    sleep(backoff_duration(attempt_0based)).await;
 }
 
 // ---------------------------------------------------------------------------
@@ -170,8 +205,13 @@ async fn try_post_json(
         .await?)
 }
 
-/// Whether an error returned by `try_post_json` should be retried. Walks the
-/// anyhow cause chain to find the underlying `reqwest::Error`. Retries on:
+/// Walk the anyhow cause chain for the first underlying `reqwest::Error`.
+fn find_reqwest_error(err: &anyhow::Error) -> Option<&reqwest::Error> {
+    err.chain()
+        .find_map(|cause| cause.downcast_ref::<reqwest::Error>())
+}
+
+/// Whether an error returned by `try_post_json` should be retried. Retries on:
 ///
 ///   - timeouts and connection failures (`is_timeout`, `is_connect`)
 ///   - HTTP 429 (Too Many Requests) and any 5xx server error
@@ -186,12 +226,7 @@ async fn try_post_json(
 /// `network_retry` events in `journal.jsonl`). The status-code classification
 /// they reduce to is unit-tested via `is_retryable_status` in `tests/retry.rs`.
 fn is_retryable_post_json_error(err: &anyhow::Error) -> bool {
-    for cause in err.chain() {
-        if let Some(rerr) = cause.downcast_ref::<reqwest::Error>() {
-            return is_retryable_reqwest_error(rerr);
-        }
-    }
-    false
+    find_reqwest_error(err).is_some_and(is_retryable_reqwest_error)
 }
 
 fn is_retryable_reqwest_error(rerr: &reqwest::Error) -> bool {
@@ -208,8 +243,10 @@ fn is_retryable_reqwest_error(rerr: &reqwest::Error) -> bool {
 }
 
 /// Short label for the journal entry describing why a `post_json` attempt
-/// is being retried. Same cause-chain walk as `is_retryable_post_json_error`.
+/// is being retried. Prefers timeout/connect/status labels when present.
 fn post_json_retry_reason(err: &anyhow::Error) -> String {
+    // Walk the full chain (not just the first reqwest error) so a decode
+    // failure wrapping a later status still surfaces the status label.
     for cause in err.chain() {
         if let Some(rerr) = cause.downcast_ref::<reqwest::Error>() {
             if rerr.is_timeout() {
@@ -241,24 +278,20 @@ async fn post_json(
     for attempt in 0..NETWORK_MAX_ATTEMPTS {
         match try_post_json(client, url, bearer_key, body).await {
             Ok(v) => return Ok(v),
+            // Non-retryable failures (deterministic 4xx, body-decode) go
+            // through unchanged — we never wasted a billed retry on them.
+            Err(e) if !is_retryable_post_json_error(&e) => return Err(e),
+            Err(e) if attempt + 1 >= NETWORK_MAX_ATTEMPTS => {
+                return Err(e).context(format!("after {} attempts", attempt + 1));
+            }
             Err(e) => {
-                let retryable = is_retryable_post_json_error(&e);
-                let is_last = attempt + 1 >= NETWORK_MAX_ATTEMPTS;
-                // Non-retryable failures (deterministic 4xx, body-decode) go
-                // through unchanged — we never wasted a billed retry on them.
-                if !retryable {
-                    return Err(e);
-                }
-                if is_last {
-                    return Err(e).context(format!("after {} attempts", attempt + 1));
-                }
                 journal(json!({
                     "event": "network_retry",
                     "attempt": attempt + 1,
                     "url": url,
                     "reason": post_json_retry_reason(&e),
                 }));
-                sleep(backoff_duration(attempt)).await;
+                sleep_backoff(attempt).await;
             }
         }
     }
@@ -280,6 +313,18 @@ async fn openrouter_call(client: &reqwest::Client, body: &Value) -> Result<ChatR
     serde_json::from_value(v).context("failed to parse OpenRouter chat response")
 }
 
+fn first_message(resp: &ChatResponse) -> Option<&ChatMessage> {
+    resp.choices.first().map(|c| &c.message)
+}
+
+/// Non-empty trimmed reasoning text from the first choice, if any.
+fn reasoning_text(resp: &ChatResponse) -> Option<&str> {
+    first_message(resp)
+        .and_then(|m| m.reasoning.as_deref())
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+}
+
 /// Reasoning/thinking models return their chain-of-thought in the `reasoning`
 /// field. When the model is configured as reasoning, journal that text if the
 /// provider supplied one. No-op for non-reasoning models.
@@ -287,13 +332,7 @@ fn journal_reasoning(resp: &ChatResponse, config: &Config) {
     if !config.reasoning {
         return;
     }
-    if let Some(text) = resp
-        .choices
-        .first()
-        .and_then(|c| c.message.reasoning.as_deref())
-        .map(str::trim)
-        .filter(|s| !s.is_empty())
-    {
+    if let Some(text) = reasoning_text(resp) {
         journal(json!({ "event": "reasoning", "text": text }));
     }
 }
@@ -330,11 +369,9 @@ async fn llm(
     for attempt in 0..LLM_MAX_ATTEMPTS {
         let resp: ChatResponse =
             openrouter_call(client, &chat_body(config, 1500, system, user)).await?;
-        if let Some(text) = extract_answer_text(
-            resp.choices
-                .first()
-                .and_then(|c| c.message.content.as_deref()),
-        ) {
+        if let Some(text) =
+            extract_answer_text(first_message(&resp).and_then(|m| m.content.as_deref()))
+        {
             journal_reasoning(&resp, config);
             return Ok(text);
         }
@@ -342,29 +379,17 @@ async fn llm(
         // present, content is empty — common stochastic failure mode) from a
         // fully empty turn (both empty — could be a transient blank response,
         // worth one or two retries).
-        let reasoning_present = resp
-            .choices
-            .first()
-            .and_then(|c| c.message.reasoning.as_deref())
-            .map(str::trim)
-            .as_ref()
-            .is_some_and(|s| !s.is_empty());
-        let reason = if reasoning_present {
+        let reason = if reasoning_text(&resp).is_some() {
             "reasoning-only"
         } else {
             "empty"
         };
-        let is_last = attempt + 1 >= LLM_MAX_ATTEMPTS;
-        if is_last {
+        let n = attempt + 1;
+        if n >= LLM_MAX_ATTEMPTS {
             return Err(anyhow::Error::msg("no text in LLM response"))
-                .context(format!("after {} attempts", attempt + 1));
+                .context(format!("after {n} attempts"));
         }
-        journal(json!({
-            "event": "empty_answer_retry",
-            "attempt": attempt + 1,
-            "reason": reason,
-        }));
-        sleep(backoff_duration(attempt)).await;
+        journal_retry_and_sleep("empty_answer_retry", n, reason).await;
     }
     unreachable!("loop returns or continues on every path")
 }
@@ -391,10 +416,70 @@ const REWRITE_TOOL: &str = r#"{
   }
 }"#;
 
+/// Shape failures from a forced rewrite tool call. Carries enough to journal
+/// a retry reason and to build the final error with the original messages.
+enum RewriteFail {
+    NoToolCall,
+    InvalidArgs(serde_json::Error),
+    MissingQuery,
+    EmptyQuery,
+}
+
+impl RewriteFail {
+    fn reason(&self) -> &'static str {
+        match self {
+            Self::NoToolCall => "no-tool-call",
+            Self::InvalidArgs(_) => "invalid-tool-args",
+            Self::MissingQuery => "missing-query-field",
+            Self::EmptyQuery => "empty-query",
+        }
+    }
+
+    fn into_final_error(self, attempts: u32) -> anyhow::Error {
+        match self {
+            Self::NoToolCall => anyhow::Error::msg("rewrite: model did not return a tool call")
+                .context(format!("after {attempts} attempts")),
+            Self::InvalidArgs(e) => anyhow::Error::from(e).context(format!(
+                "rewrite: tool call missing valid arguments JSON after {attempts} attempts"
+            )),
+            Self::MissingQuery => {
+                anyhow::Error::msg("rewrite: tool call arguments missing 'query' field")
+                    .context(format!("after {attempts} attempts"))
+            }
+            Self::EmptyQuery => {
+                anyhow::Error::msg("rewrite: tool call arguments had empty 'query' field")
+                    .context(format!("after {attempts} attempts"))
+            }
+        }
+    }
+}
+
+impl From<RewriteQueryReject> for RewriteFail {
+    fn from(reject: RewriteQueryReject) -> Self {
+        match reject {
+            RewriteQueryReject::Missing => Self::MissingQuery,
+            RewriteQueryReject::Empty => Self::EmptyQuery,
+        }
+    }
+}
+
+/// Pull the search query out of a forced `generate_search_query` tool call.
+fn rewrite_query_from_response(resp: &ChatResponse) -> Result<String, RewriteFail> {
+    let Some(tc) = first_message(resp)
+        .and_then(|m| m.tool_calls.as_ref())
+        .and_then(|tcs| tcs.first())
+    else {
+        return Err(RewriteFail::NoToolCall);
+    };
+    let args: Value =
+        serde_json::from_str(&tc.function.arguments).map_err(RewriteFail::InvalidArgs)?;
+    parse_rewrite_query_arg(&args).map_err(RewriteFail::from)
+}
+
 /// Forced-tool-call LLM for query rewriting. Sends `tool_choice: "required"`
 /// so the model must respond with a `generate_search_query` tool call.
 /// Retries on any tool-call-shape failure (Class A) — no tool call at all,
-/// unparseable arguments, or missing `query` field — bounded by
+/// unparseable arguments, missing `query`, or blank `query` — bounded by
 /// `REWRITE_MAX_ATTEMPTS`. Reasoning-capable models sometimes ignore
 /// `tool_choice: "required"` and answer in prose instead.
 async fn rewrite_llm(
@@ -410,64 +495,19 @@ async fn rewrite_llm(
 
     for attempt in 0..REWRITE_MAX_ATTEMPTS {
         let resp = openrouter_call(client, &body).await?;
-        let Some(tc) = resp
-            .choices
-            .first()
-            .and_then(|c| c.message.tool_calls.as_ref())
-            .and_then(|tcs| tcs.first())
-        else {
-            let is_last = attempt + 1 >= REWRITE_MAX_ATTEMPTS;
-            if is_last {
-                return Err(anyhow::Error::msg(
-                    "rewrite: model did not return a tool call",
-                ))
-                .context(format!("after {} attempts", attempt + 1));
+        match rewrite_query_from_response(&resp) {
+            Ok(query) => {
+                journal_reasoning(&resp, config);
+                return Ok(query);
             }
-            journal(json!({
-                "event": "rewrite_retry",
-                "attempt": attempt + 1,
-                "reason": "no-tool-call",
-            }));
-            sleep(backoff_duration(attempt)).await;
-            continue;
-        };
-        let args: Value = match serde_json::from_str(&tc.function.arguments) {
-            Ok(v) => v,
-            Err(e) => {
-                let is_last = attempt + 1 >= REWRITE_MAX_ATTEMPTS;
-                if is_last {
-                    return Err(e).context(format!(
-                        "rewrite: tool call missing valid arguments JSON after {} attempts",
-                        attempt + 1
-                    ));
+            Err(fail) => {
+                let n = attempt + 1;
+                if n >= REWRITE_MAX_ATTEMPTS {
+                    return Err(fail.into_final_error(n));
                 }
-                journal(json!({
-                    "event": "rewrite_retry",
-                    "attempt": attempt + 1,
-                    "reason": "invalid-tool-args",
-                }));
-                sleep(backoff_duration(attempt)).await;
-                continue;
+                journal_retry_and_sleep("rewrite_retry", n, fail.reason()).await;
             }
-        };
-        let Some(query) = args["query"].as_str() else {
-            let is_last = attempt + 1 >= REWRITE_MAX_ATTEMPTS;
-            if is_last {
-                return Err(anyhow::Error::msg(
-                    "rewrite: tool call arguments missing 'query' field",
-                ))
-                .context(format!("after {} attempts", attempt + 1));
-            }
-            journal(json!({
-                "event": "rewrite_retry",
-                "attempt": attempt + 1,
-                "reason": "missing-query-field",
-            }));
-            sleep(backoff_duration(attempt)).await;
-            continue;
-        };
-        journal_reasoning(&resp, config);
-        return Ok(query.trim().to_string());
+        }
     }
     unreachable!("loop returns or continues on every path")
 }
@@ -476,18 +516,8 @@ async fn rewrite_llm(
 // Firecrawl search: ONE call that both finds the top results and returns
 // each page's full text as markdown. This replaces the old search + dedupe
 // + rank + fetch stages. Docs: https://docs.firecrawl.dev
+// Response shape parsing lives in `answerbot::parse_firecrawl_web`.
 // ---------------------------------------------------------------------------
-#[derive(Deserialize)]
-struct FcResult {
-    url: String,
-    #[serde(default)]
-    title: String,
-    #[serde(default)]
-    markdown: Option<String>,
-    #[serde(default)]
-    description: Option<String>,
-}
-
 async fn search(client: &reqwest::Client, query: &str, registry: &mut Vec<Source>) -> Result<()> {
     let key = std::env::var("FIRECRAWL_API_KEY").context("FIRECRAWL_API_KEY not set")?;
     let body = json!({
@@ -498,18 +528,7 @@ async fn search(client: &reqwest::Client, query: &str, registry: &mut Vec<Source
     });
     let resp: Value = post_json(client, "https://api.firecrawl.dev/v2/search", &key, &body).await?;
 
-    // Surface response-shape drift as an explicit error instead of masking it
-    // as "no usable pages". Firecrawl's /v2/search contract is documented to
-    // return { data: { web: [ { url, title, markdown, ... }, ... ] } }; if
-    // the field is missing or the wrong type, propagate a context-rich error
-    // so the cause is diagnosable instead of looking like empty content.
-    let web_value = resp
-        .get("data")
-        .and_then(|d| d.get("web"))
-        .filter(|v| !v.is_null())
-        .context("Firecrawl /v2/search: missing or null data.web field")?;
-    let results: Vec<FcResult> = serde_json::from_value(web_value.clone())
-        .context("Firecrawl /v2/search: data.web entries failed to deserialize")?;
+    let results = parse_firecrawl_web(&resp)?;
 
     for r in results {
         // Dedup: skip anything we've already registered (the registry IS the set).
@@ -533,24 +552,6 @@ async fn search(client: &reqwest::Client, query: &str, registry: &mut Vec<Source
     }
     Ok(())
 }
-
-const QUERY_SYSTEM: &str = "You are a search query generator. Rewrite the \
-user's question as a short, effective web search query, using the \
-`generate_search_query` tool.\n\n\
-Rules (follow every rule):\n\
-- Keep the query concise \u{2014} 1\u{2013}6 words for best results.\n\
-- Write plain natural language phrases only.\n\
-- Do NOT use search operator syntax: site:, filetype:, inurl:, \
-  intitle:, OR, AND, NOT, -, or quotation marks.\n\
-- Do NOT write sentences \u{2014} write only the query.\n\
-- Include the year for questions about recent events or dates.\n\n\
-Examples:\n\
-  Question: What is the capital of France?\n\
-  Query: capital of France\n\n\
-  Question: Latest news on the Rust Foundation\n\
-  Query: Rust Foundation news 2026\n\n\
-  Question: What is the latest version of Rust?\n\
-  Query: latest Rust version 2026";
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -586,7 +587,7 @@ async fn main() -> Result<()> {
         .build()?;
 
     // 2. Rewrite the question into one good search query -------------------
-    let query = rewrite_llm(&client, &config, QUERY_SYSTEM, &anchored).await?;
+    let query = rewrite_llm(&client, &config, &query_system_prompt(&TODAY), &anchored).await?;
     eprintln!("searching: {query}");
     journal(json!({ "event": "query", "text": query }));
 
@@ -623,6 +624,12 @@ async fn main() -> Result<()> {
     // 5. Honest citations: strip any [Sn] that isn't a real source ----------
     let mut clean = strip_invalid_citations(&answer, &registry);
 
+    // After the one allowed re-search, a further SEARCH: must not be printed
+    // — and must not burn a citation-retry LLM call first.
+    if should_reject_late_requery(&clean) {
+        bail!("model requested another search after the one allowed re-search");
+    }
+
     // 5b. One retry if the model produced a correct-looking answer with zero
     // citations (small models sometimes ignore the citation rule).
     if !has_citations(&clean) && !registry.is_empty() {
@@ -636,6 +643,10 @@ async fn main() -> Result<()> {
         );
         let retry = llm(&client, &config, &system, &retry_prompt).await?;
         clean = strip_invalid_citations(&retry, &registry);
+        // Citation retry also insists; reject a SEARCH: from that path too.
+        if should_reject_late_requery(&clean) {
+            bail!("model requested another search after the one allowed re-search");
+        }
     }
 
     // 6. Print the answer + a source list built from the real registry ------

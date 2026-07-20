@@ -15,9 +15,10 @@ the code.
 
 Deliberate design constraints (do not "fix" these without being asked):
 
-- **One re-search.** The answer loop allows exactly one `SEARCH:` retry, enforced structurally by the `SEARCH:` branch in `src/main.rs` (no inner loop) and in the prompt by the `insist=true` suffix that `answer_prompt` in `src/lib.rs` appends on the second call.
+- **One re-search.** The answer loop allows exactly one `SEARCH:` retry, enforced structurally by the `SEARCH:` branch in `src/main.rs` (no inner loop) and in the prompt by the `insist=true` suffix that `answer_prompt` in `src/lib.rs` appends on the second call. A further `SEARCH:` after that path is rejected (`should_reject_late_requery`).
 - **Everything journaled.** Every step appends a JSON line to `journal.jsonl`
-  (gitignored runtime artifact — never commit it).
+  (override with `ANSWERBOT_JOURNAL`; gitignored runtime artifact — never commit it).
+  The journal may contain full questions, queries, reasoning, and answers.
 
 ## Commands
 
@@ -61,7 +62,14 @@ Tests live in `tests/` as integration tests against the helpers in
 Secrets (API keys) are loaded from `.env` at the repo root (via `dotenvy`):
 `OPENROUTER_API_KEY`, `FIRECRAWL_API_KEY`. The model itself is selected in
 `config/models.json` (parsed by `parse_config` in `src/lib.rs`), not via an
-env var.
+env var. The file is gitignored — copy `config/models.json.example` locally.
+Path overrides (optional):
+
+- `ANSWERBOT_CONFIG` — models JSON path (default `config/models.json`)
+- `ANSWERBOT_JOURNAL` — journal file path (default `journal.jsonl`)
+
+Paths are relative to the process CWD unless absolute. Run from the repo root
+or set the overrides.
 
 - `.env` is gitignored and contains real keys — never commit, print, or copy
   its contents. Keep [.env.example](.env.example) in sync when adding variables.
