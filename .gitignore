@@ -29,6 +29,11 @@
 Thumbs.db
 desktop.ini
 
+# --- Python ---
+# tests/run_eval.py emits bytecode cache when run.
+__pycache__/
+*.pyc
+
 # --- Logs / runtime artifacts ---
 *.log
 logs/

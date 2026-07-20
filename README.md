@@ -72,25 +72,43 @@ instruction-following gaps in smaller reasoning models. The retry is bounded —
 exactly one, same as the `SEARCH:` re-search limit — to keep the structural
 constraints from AGENTS.md intact.
 
-Known flaky case: `openai/gpt-oss-20b` occasionally refuses the forced tool
-call for the query-rewrite step on historical questions (e.g. "When did World
-War II end?"), failing with `rewrite: model did not return a tool call`. This
-is logged in `journal.jsonl` as a failure exit and is not retried; switch
-models or rephrase the question if you hit it.
+Three bounded retry loops catch weaker-model failure modes:
+
+- `rewrite_llm` retries up to `REWRITE_MAX_ATTEMPTS` times when the rewrite
+  step emits no tool call, malformed arguments, or a missing `query` field.
+  `openai/gpt-oss-20b` occasionally refuses the forced tool call on
+  historical questions; the retry absorbs that without operator action.
+- `llm` retries up to `LLM_MAX_ATTEMPTS` times when the answer comes back
+  with empty `content` — common for reasoning models that finish their
+  chain-of-thought but emit no final answer.
+- `post_json` retries up to `NETWORK_MAX_ATTEMPTS` times on transient HTTP
+  failures (timeouts, connection errors, HTTP 429, any 5xx). Non-retryable
+  errors (other 4xx, body-decode failures) propagate immediately.
+
+Every retry emits a journal event with the attempt number and a short reason
+(`rewrite_retry`, `empty_answer_retry`, `network_retry`). All three use
+exponential backoff (`backoff_ms` in `src/lib.rs`: 250, 500, 1000, 2000,
+4000 ms, capped at 4 s) so a stuck upstream does not get hammered.
 
 ## Knobs (top of `main.rs`)
 
 - `MAX_SOURCES_PER_SEARCH` — pages read per trip (default 4)
 - `MAX_CHARS_PER_SOURCE` — truncation limit per page (default 8,000)
 - `REQUEST_TIMEOUT_SECS` — hard cap per network call (default 30)
+- `REWRITE_MAX_ATTEMPTS` — total attempts at the rewrite tool call (default 5)
+- `LLM_MAX_ATTEMPTS` — total attempts at the answering call (default 3)
+- `NETWORK_MAX_ATTEMPTS` — total attempts at each HTTP POST (default 3)
 
-`REQUEST_TIMEOUT_SECS` bounds a single HTTP call, not the whole run. The
-retry path can chain up to four sequential network calls (rewrite → search →
-answer → re-search → answer → zero-citation retry), so a single CLI
-invocation can take ~2 minutes in the worst case before any per-call timeout
-fires. Anyone wrapping the CLI in an outer timeout (e.g. `tests/run_eval.py`
-uses 60s) should account for this — slow models on the retry path will hit
-the outer limit, not the per-call one.
+`REQUEST_TIMEOUT_SECS` bounds a single HTTP call, not the whole run. With
+retries enabled, each HTTP attempt can take up to three timeouts plus the
+backoff schedule (default 30 s + 250 ms + 30 s + 500 ms + 30 s ≈ 91 s), and
+each LLM call (`rewrite_llm`, `llm`) layers its own attempt cap on top
+(`REWRITE_MAX_ATTEMPTS` / `LLM_MAX_ATTEMPTS`). The worst-case chain —
+rewrite → search → answer → optional re-search → optional zero-citation
+retry, with every retry exhausted — is on the order of **20–25 minutes**;
+typical runs are well under a minute. Anyone wrapping the CLI in an outer
+timeout (e.g. `tests/run_eval.py` uses 60 s) should account for this: slow
+models on the retry path will hit the outer limit, not the per-call one.
 
 ## Development
 

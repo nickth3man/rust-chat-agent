@@ -208,6 +208,40 @@ pub fn truncate_content(content: &mut String, max: usize) {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Retry policy — pure arithmetic shared with the orchestration in
+// `src/main.rs`. Kept here so the integration tests in `tests/` can exercise
+// the schedule and the status classification without standing up the binary.
+// ---------------------------------------------------------------------------
+
+/// Backoff duration in milliseconds for a 0-indexed attempt number.
+/// Schedule: 250, 500, 1000, 2000, 4000 (capped — further attempts hold at
+/// 4000 ms). `attempt == 0` is the *first* retry's delay (i.e. applied after
+/// the original attempt fails), not the original attempt's own delay.
+pub fn backoff_ms(attempt: u32) -> u64 {
+    250u64 << attempt.min(4)
+}
+
+/// Whether an HTTP status code is retryable for the network-retry policy.
+/// Retryable: 429 (Too Many Requests) and any 5xx server error. Not
+/// retryable: 2xx, 3xx, and 4xx other than 429. Caller-side errors (e.g.
+/// connection failures, timeouts, body-decode failures) are not classified
+/// here — they are handled before `.status()` would yield a code.
+pub fn is_retryable_status(status: u16) -> bool {
+    status == 429 || (500..=599).contains(&status)
+}
+
+/// Extract a non-empty, trimmed answer from a chat-completions `content`
+/// field. Returns `None` when `content` is missing, empty, or whitespace-
+/// only — so the caller's retry loop can classify the failure (reasoning-
+/// only vs fully empty) and retry.
+pub fn extract_answer_text(content: Option<&str>) -> Option<String> {
+    content
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_string)
+}
+
 const ANSWER_SYSTEM_TEMPLATE: &str = "\
 # ROLE
 You are a research assistant. Answer ONLY from the sources provided below.

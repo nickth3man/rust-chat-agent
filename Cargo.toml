@@ -5,7 +5,7 @@ edition = "2021"
 publish = false
 
 [dependencies]
-tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "time"] }
 # reqwest 0.13 renamed the old `rustls-tls` feature to `rustls`.
 reqwest = { version = "0.13", default-features = false, features = ["json", "rustls"] }
 serde = { version = "1", features = ["derive"] }

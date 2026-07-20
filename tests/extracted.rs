@@ -3,12 +3,48 @@
 // truncate_content.
 
 use answerbot::{
-    has_citations, next_source_id, parse_config, parse_requery, registry_contains_url,
-    truncate_content,
+    extract_answer_text, has_citations, next_source_id, parse_config, parse_requery,
+    registry_contains_url, truncate_content,
 };
 mod common;
 
 use common::{full_src, src};
+
+// -- extract_answer_text: content-trimming helper for LLM retry ---------
+
+#[test]
+fn extract_answer_text_returns_trimmed_content() {
+    assert_eq!(
+        extract_answer_text(Some("  Paris\n")),
+        Some("Paris".to_string())
+    );
+}
+
+#[test]
+fn extract_answer_text_returns_typical_content() {
+    assert_eq!(
+        extract_answer_text(Some("The capital is Paris.")),
+        Some("The capital is Paris.".to_string())
+    );
+}
+
+#[test]
+fn extract_answer_text_none_when_missing() {
+    assert_eq!(extract_answer_text(None), None);
+}
+
+#[test]
+fn extract_answer_text_none_when_empty() {
+    assert_eq!(extract_answer_text(Some("")), None);
+}
+
+#[test]
+fn extract_answer_text_none_when_whitespace_only() {
+    // Regression: previously, Some("   ") bypassed the LLM retry loop and
+    // was returned as Ok(""). It must now classify as None so the existing
+    // empty/reasoning-only retry classification runs.
+    assert_eq!(extract_answer_text(Some("   \n\t ")), None);
+}
 
 /// Compare two f64 values within machine epsilon. clippy denies `assert_eq!` on floats.
 fn assert_f64_eq(a: f64, b: f64) {

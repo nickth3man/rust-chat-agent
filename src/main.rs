@@ -25,16 +25,26 @@ use serde_json::{json, Value};
 use std::io::Write;
 use std::sync::LazyLock;
 use std::time::{SystemTime, UNIX_EPOCH};
+use tokio::time::sleep;
 
 use answerbot::{
-    answer_prompt, answer_system_prompt, has_citations, next_source_id, parse_config,
-    parse_requery, registry_contains_url, rewrite_with_anchor, strip_invalid_citations,
-    truncate_content, Config, Source,
+    answer_prompt, answer_system_prompt, extract_answer_text, has_citations, is_retryable_status,
+    next_source_id, parse_config, parse_requery, registry_contains_url, rewrite_with_anchor,
+    strip_invalid_citations, truncate_content, Config, Source,
 };
 
 const MAX_SOURCES_PER_SEARCH: usize = 4; // pages Firecrawl reads per trip
 const MAX_CHARS_PER_SOURCE: usize = 8_000; // truncate long pages ("safe limits")
 const REQUEST_TIMEOUT_SECS: u64 = 30;
+/// Bounded retry caps. Each is the TOTAL number of attempts (1 = no retry).
+/// `NETWORK_MAX_ATTEMPTS` covers transient HTTP failures (timeout, connect,
+/// 429, 5xx) inside `post_json`. `REWRITE_MAX_ATTEMPTS` covers the rewrite
+/// step emitting a malformed tool call (Class A: a stochastic small-model
+/// failure). `LLM_MAX_ATTEMPTS` covers the answering step returning no text
+/// (Class B: reasoning-only or empty turn from a reasoning model).
+const NETWORK_MAX_ATTEMPTS: u32 = 3;
+const REWRITE_MAX_ATTEMPTS: u32 = 5;
+const LLM_MAX_ATTEMPTS: u32 = 3;
 
 // ---------------------------------------------------------------------------
 // Model configuration — loaded from config/models.json at startup.
@@ -124,10 +134,26 @@ struct ToolFunction {
     arguments: String,
 }
 
-/// POST a JSON body with bearer auth, return the parsed JSON response.
-/// Shared by the `OpenRouter` chat-completions call and the Firecrawl
-/// search call so HTTP-status and timeout handling lives in one place.
-async fn post_json(
+// --- Retry plumbing ------------------------------------------------------
+
+/// Exponential backoff: 250ms, 500ms, 1000ms, 2000ms, 4000ms (capped at 4s).
+/// `attempt` is 0-indexed (0 = first retry). Pure arithmetic; sleep happens
+/// at call site. Delegates to `answerbot::backoff_ms` so the schedule lives
+/// in the pure lib (and is covered by the integration tests).
+fn backoff_duration(attempt: u32) -> std::time::Duration {
+    std::time::Duration::from_millis(answerbot::backoff_ms(attempt))
+}
+
+/// One POST attempt: send → check status → parse JSON. Wrapped by `post_json`
+/// in a bounded retry loop. Kept separate so the retry classification can
+/// inspect a single error in isolation.
+///
+/// Note: HTTP `Retry-After` on 429 responses is NOT honored — by the time
+/// `error_for_status()` converts the response to an error, the headers are
+/// consumed and unavailable. We retry with fixed exponential backoff instead.
+/// Acceptable for current usage (single query per invocation, generous upstream
+/// limits); revisit if 429 storms become operational.
+async fn try_post_json(
     client: &reqwest::Client,
     url: &str,
     bearer_key: &str,
@@ -142,6 +168,101 @@ async fn post_json(
         .error_for_status()?
         .json()
         .await?)
+}
+
+/// Whether an error returned by `try_post_json` should be retried. Walks the
+/// anyhow cause chain to find the underlying `reqwest::Error`. Retries on:
+///
+///   - timeouts and connection failures (`is_timeout`, `is_connect`)
+///   - HTTP 429 (Too Many Requests) and any 5xx server error
+///
+/// Does NOT retry on:
+///
+///   - other 4xx responses (400/401/403/404/...): deterministic, money-wasting
+///   - body-decode failures (`is_decode`): response shape changed, deterministic
+///
+/// Note: not unit-tested. `reqwest::Error` has no public constructor, so these
+/// classifiers are exercised end-to-end via real `post_json` retries (see
+/// `network_retry` events in `journal.jsonl`). The status-code classification
+/// they reduce to is unit-tested via `is_retryable_status` in `tests/retry.rs`.
+fn is_retryable_post_json_error(err: &anyhow::Error) -> bool {
+    for cause in err.chain() {
+        if let Some(rerr) = cause.downcast_ref::<reqwest::Error>() {
+            return is_retryable_reqwest_error(rerr);
+        }
+    }
+    false
+}
+
+fn is_retryable_reqwest_error(rerr: &reqwest::Error) -> bool {
+    if rerr.is_timeout() || rerr.is_connect() {
+        return true;
+    }
+    if rerr.is_decode() {
+        return false;
+    }
+    if let Some(status) = rerr.status() {
+        return is_retryable_status(status.as_u16());
+    }
+    false
+}
+
+/// Short label for the journal entry describing why a `post_json` attempt
+/// is being retried. Same cause-chain walk as `is_retryable_post_json_error`.
+fn post_json_retry_reason(err: &anyhow::Error) -> String {
+    for cause in err.chain() {
+        if let Some(rerr) = cause.downcast_ref::<reqwest::Error>() {
+            if rerr.is_timeout() {
+                return "timeout".to_string();
+            }
+            if rerr.is_connect() {
+                return "connect".to_string();
+            }
+            if let Some(status) = rerr.status() {
+                return format!("status {}", status.as_u16());
+            }
+        }
+    }
+    "unknown".to_string()
+}
+
+/// POST a JSON body with bearer auth, return the parsed JSON response.
+/// Shared by the `OpenRouter` chat-completions call and the Firecrawl
+/// search call so HTTP-status and timeout handling lives in one place.
+/// Retries transient failures (timeout, connect, 429, 5xx) with exponential
+/// backoff up to `NETWORK_MAX_ATTEMPTS`. Non-retryable errors (other 4xx,
+/// body-decode failures) propagate immediately.
+async fn post_json(
+    client: &reqwest::Client,
+    url: &str,
+    bearer_key: &str,
+    body: &Value,
+) -> Result<Value> {
+    for attempt in 0..NETWORK_MAX_ATTEMPTS {
+        match try_post_json(client, url, bearer_key, body).await {
+            Ok(v) => return Ok(v),
+            Err(e) => {
+                let retryable = is_retryable_post_json_error(&e);
+                let is_last = attempt + 1 >= NETWORK_MAX_ATTEMPTS;
+                // Non-retryable failures (deterministic 4xx, body-decode) go
+                // through unchanged — we never wasted a billed retry on them.
+                if !retryable {
+                    return Err(e);
+                }
+                if is_last {
+                    return Err(e).context(format!("after {} attempts", attempt + 1));
+                }
+                journal(json!({
+                    "event": "network_retry",
+                    "attempt": attempt + 1,
+                    "url": url,
+                    "reason": post_json_retry_reason(&e),
+                }));
+                sleep(backoff_duration(attempt)).await;
+            }
+        }
+    }
+    unreachable!("loop returns or continues on every path")
 }
 
 /// POST a chat-completions request body to `OpenRouter` and return the parsed
@@ -197,23 +318,55 @@ fn chat_body(config: &Config, max_tokens: u64, system: &str, user: &str) -> Valu
 }
 
 /// Answering LLM call: returns the text reply from a plain chat completion.
+/// Retries on empty `content` (Class B) — common with reasoning models that
+/// occasionally finish their chain-of-thought but emit no final answer, or
+/// transiently return an entirely empty turn. Bounded by `LLM_MAX_ATTEMPTS`.
 async fn llm(
     client: &reqwest::Client,
     config: &Config,
     system: &str,
     user: &str,
 ) -> Result<String> {
-    let resp: ChatResponse =
-        openrouter_call(client, &chat_body(config, 1500, system, user)).await?;
-    let text = resp
-        .choices
-        .first()
-        .and_then(|c| c.message.content.as_deref())
-        .context("no text in LLM response")?
-        .trim()
-        .to_string();
-    journal_reasoning(&resp, config);
-    Ok(text)
+    for attempt in 0..LLM_MAX_ATTEMPTS {
+        let resp: ChatResponse =
+            openrouter_call(client, &chat_body(config, 1500, system, user)).await?;
+        if let Some(text) = extract_answer_text(
+            resp.choices
+                .first()
+                .and_then(|c| c.message.content.as_deref()),
+        ) {
+            journal_reasoning(&resp, config);
+            return Ok(text);
+        }
+        // Content is empty/None. Distinguish "reasoning-only" (reasoning is
+        // present, content is empty — common stochastic failure mode) from a
+        // fully empty turn (both empty — could be a transient blank response,
+        // worth one or two retries).
+        let reasoning_present = resp
+            .choices
+            .first()
+            .and_then(|c| c.message.reasoning.as_deref())
+            .map(str::trim)
+            .as_ref()
+            .is_some_and(|s| !s.is_empty());
+        let reason = if reasoning_present {
+            "reasoning-only"
+        } else {
+            "empty"
+        };
+        let is_last = attempt + 1 >= LLM_MAX_ATTEMPTS;
+        if is_last {
+            return Err(anyhow::Error::msg("no text in LLM response"))
+                .context(format!("after {} attempts", attempt + 1));
+        }
+        journal(json!({
+            "event": "empty_answer_retry",
+            "attempt": attempt + 1,
+            "reason": reason,
+        }));
+        sleep(backoff_duration(attempt)).await;
+    }
+    unreachable!("loop returns or continues on every path")
 }
 
 // ---------------------------------------------------------------------------
@@ -240,6 +393,10 @@ const REWRITE_TOOL: &str = r#"{
 
 /// Forced-tool-call LLM for query rewriting. Sends `tool_choice: "required"`
 /// so the model must respond with a `generate_search_query` tool call.
+/// Retries on any tool-call-shape failure (Class A) — no tool call at all,
+/// unparseable arguments, or missing `query` field — bounded by
+/// `REWRITE_MAX_ATTEMPTS`. Reasoning-capable models sometimes ignore
+/// `tool_choice: "required"` and answer in prose instead.
 async fn rewrite_llm(
     client: &reqwest::Client,
     config: &Config,
@@ -250,20 +407,69 @@ async fn rewrite_llm(
     let mut body = chat_body(config, 250, system, user);
     body["tools"] = json!([tool_schema]);
     body["tool_choice"] = json!("required");
-    let resp: ChatResponse = openrouter_call(client, &body).await?;
-    let tc = resp
-        .choices
-        .first()
-        .and_then(|c| c.message.tool_calls.as_ref())
-        .and_then(|tcs| tcs.first())
-        .context("rewrite: model did not return a tool call")?;
-    let args: Value = serde_json::from_str(&tc.function.arguments)
-        .context("rewrite: tool call missing valid arguments JSON")?;
-    journal_reasoning(&resp, config);
-    args["query"]
-        .as_str()
-        .map(|s| s.trim().to_string())
-        .context("rewrite: tool call arguments missing 'query' field")
+
+    for attempt in 0..REWRITE_MAX_ATTEMPTS {
+        let resp = openrouter_call(client, &body).await?;
+        let Some(tc) = resp
+            .choices
+            .first()
+            .and_then(|c| c.message.tool_calls.as_ref())
+            .and_then(|tcs| tcs.first())
+        else {
+            let is_last = attempt + 1 >= REWRITE_MAX_ATTEMPTS;
+            if is_last {
+                return Err(anyhow::Error::msg(
+                    "rewrite: model did not return a tool call",
+                ))
+                .context(format!("after {} attempts", attempt + 1));
+            }
+            journal(json!({
+                "event": "rewrite_retry",
+                "attempt": attempt + 1,
+                "reason": "no-tool-call",
+            }));
+            sleep(backoff_duration(attempt)).await;
+            continue;
+        };
+        let args: Value = match serde_json::from_str(&tc.function.arguments) {
+            Ok(v) => v,
+            Err(e) => {
+                let is_last = attempt + 1 >= REWRITE_MAX_ATTEMPTS;
+                if is_last {
+                    return Err(e).context(format!(
+                        "rewrite: tool call missing valid arguments JSON after {} attempts",
+                        attempt + 1
+                    ));
+                }
+                journal(json!({
+                    "event": "rewrite_retry",
+                    "attempt": attempt + 1,
+                    "reason": "invalid-tool-args",
+                }));
+                sleep(backoff_duration(attempt)).await;
+                continue;
+            }
+        };
+        let Some(query) = args["query"].as_str() else {
+            let is_last = attempt + 1 >= REWRITE_MAX_ATTEMPTS;
+            if is_last {
+                return Err(anyhow::Error::msg(
+                    "rewrite: tool call arguments missing 'query' field",
+                ))
+                .context(format!("after {} attempts", attempt + 1));
+            }
+            journal(json!({
+                "event": "rewrite_retry",
+                "attempt": attempt + 1,
+                "reason": "missing-query-field",
+            }));
+            sleep(backoff_duration(attempt)).await;
+            continue;
+        };
+        journal_reasoning(&resp, config);
+        return Ok(query.trim().to_string());
+    }
+    unreachable!("loop returns or continues on every path")
 }
 
 // ---------------------------------------------------------------------------
