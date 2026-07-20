@@ -607,10 +607,7 @@ async fn main() -> Result<()> {
     )
     .await?;
 
-    // Treat an empty requery (the model emits `SEARCH:` with no following
-    // text) as "no requery" so we don't fire a billed Firecrawl call with an
-    // empty query string. See audit H-02.
-    if let Some(new_query) = parse_requery(&answer).filter(|q| !q.is_empty()) {
+    if let Some(new_query) = parse_requery(&answer) {
         eprintln!("searching again: {new_query}");
         journal(json!({ "event": "requery", "text": new_query }));
         search(&client, &new_query, &mut registry).await?;

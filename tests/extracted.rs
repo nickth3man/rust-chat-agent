@@ -115,13 +115,13 @@ fn parse_requery_trims_whitespace() {
 
 #[test]
 fn parse_requery_just_prefix_no_query() {
-    // strip_prefix("SEARCH:") on "SEARCH:" returns Some(""), trimmed to ""
-    assert_eq!(parse_requery("SEARCH:"), Some(String::new()));
+    // Empty query after the prefix is not a requery (would bill Firecrawl).
+    assert_eq!(parse_requery("SEARCH:"), None);
 }
 
 #[test]
 fn parse_requery_prefix_only_whitespace() {
-    assert_eq!(parse_requery("SEARCH:   "), Some(String::new()));
+    assert_eq!(parse_requery("SEARCH:   "), None);
 }
 
 #[test]

@@ -114,8 +114,7 @@ pub fn rewrite_with_anchor(question: &str, today: &str) -> String {
     if lower.contains("as of") {
         return question.to_string();
     }
-    let needs_anchor = ANCHOR_PHRASES.iter().any(|p| lower.contains(p));
-    if needs_anchor {
+    if ANCHOR_PHRASES.iter().any(|p| lower.contains(p)) {
         format!("{question} (as of {today})")
     } else {
         question.to_string()
@@ -150,10 +149,18 @@ pub fn parse_config(contents: &str) -> Result<Config> {
     serde_json::from_str(contents).context("failed to parse config")
 }
 
+fn trimmed_non_empty(s: &str) -> Option<&str> {
+    let trimmed = s.trim();
+    (!trimmed.is_empty()).then_some(trimmed)
+}
+
 /// Extract a re-search query from an answer that starts with `SEARCH:`.
-/// Returns `None` when the answer is not a requery request.
+/// Returns `None` when the answer is not a requery or the query is blank.
 pub fn parse_requery(answer: &str) -> Option<String> {
-    answer.strip_prefix("SEARCH:").map(|s| s.trim().to_string())
+    answer
+        .strip_prefix("SEARCH:")
+        .and_then(trimmed_non_empty)
+        .map(str::to_string)
 }
 
 /// Check whether a URL is already in the source registry (dedup helper).
@@ -200,11 +207,7 @@ pub fn has_citations(answer: &str) -> bool {
 /// No-op when `max >= content.len()`.
 pub fn truncate_content(content: &mut String, max: usize) {
     if max < content.len() {
-        let mut byte_idx = max;
-        while !content.is_char_boundary(byte_idx) {
-            byte_idx -= 1;
-        }
-        content.truncate(byte_idx);
+        content.truncate(content.floor_char_boundary(max));
     }
 }
 
@@ -236,10 +239,7 @@ pub fn is_retryable_status(status: u16) -> bool {
 /// only — so the caller's retry loop can classify the failure (reasoning-
 /// only vs fully empty) and retry.
 pub fn extract_answer_text(content: Option<&str>) -> Option<String> {
-    content
-        .map(str::trim)
-        .filter(|s| !s.is_empty())
-        .map(str::to_string)
+    content.and_then(trimmed_non_empty).map(str::to_string)
 }
 
 const ANSWER_SYSTEM_TEMPLATE: &str = "\
