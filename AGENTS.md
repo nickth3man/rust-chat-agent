@@ -7,22 +7,25 @@ Guidance for AI coding agents working in this repository.
 `answerbot` — a single-binary Rust CLI that answers a question by (1) asking an
 LLM (via OpenRouter) to rewrite it into a search query, (2) searching + reading
 pages with Firecrawl, and (3) answering with `[S1]`-style citations that are
-validated against the actually-fetched sources. The orchestration (env loading,
-LLM/Firecrawl calls, journaling, printing) lives in [src/main.rs](src/main.rs);
-the pure LLM-facing helpers (`Source`, prompt formatting, citation validation)
-live in [src/lib.rs](src/lib.rs). [README.md](README.md) maps each flow step to
-the code.
+validated against the actually-fetched sources. Orchestration (env loading,
+LLM/Firecrawl calls, journaling, printing) lives in library modules under
+`src/` (`run`, `llm`, `search`, `http`, `journal`, `paths`); [src/main.rs](src/main.rs)
+is a one-line `run_cli()` wrapper. Pure LLM-facing helpers (`Source`, prompt
+formatting, citation validation) live in [src/lib.rs](src/lib.rs).
+[README.md](README.md) maps each flow step to the code.
 
 Deliberate design constraints (do not "fix" these without being asked):
 
-- **One re-search.** The answer loop allows exactly one `SEARCH:` retry, enforced structurally by the `SEARCH:` branch in `src/main.rs` (no inner loop) and in the prompt by the `insist=true` suffix that `answer_prompt` in `src/lib.rs` appends on the second call. A further `SEARCH:` after that path is rejected (`should_reject_late_requery`).
+- **One re-search.** The answer loop allows exactly one `SEARCH:` retry, enforced structurally by the `SEARCH:` branch in `src/run.rs` (no inner loop) and in the prompt by the `insist=true` suffix that `answer_prompt` in `src/lib.rs` appends on the second call. A further `SEARCH:` after that path is rejected (`should_reject_late_requery`).
 - **Everything journaled.** Every step appends a JSON line to `journal.jsonl`
   (override with `ANSWERBOT_JOURNAL`; gitignored runtime artifact — never commit it).
   The journal may contain full questions, queries, reasoning, and answers.
 
 ## Commands
 
-Tooling: `cargo install --locked just cargo-deny` (one-time).
+Tooling (one-time): `cargo install --locked just cargo-deny cargo-llvm-cov`.
+The pinned toolchain in [rust-toolchain.toml](rust-toolchain.toml) includes
+`llvm-tools-preview` (required by `cargo-llvm-cov`); `rustup show` installs it.
 
 | Task | Command |
 |---|---|
@@ -31,10 +34,19 @@ Tooling: `cargo install --locked just cargo-deny` (one-time).
 | Type-check | `just check` |
 | Dependency audit | `just deny` |
 | Everything CI runs | `just ci` |
+| Coverage (line + region, pinned stable) | `just coverage` |
+| Coverage HTML / text report | `just coverage-report` |
+| Branch coverage (needs nightly) | `just coverage-branch` |
 | Ask a question | `just run "your question"` |
 
-Tests live in `tests/` as integration tests against the helpers in
-`src/lib.rs`. CI runs `cargo test --locked` on every push and PR.
+Tests live in `tests/` as integration tests against the library (including
+wiremock-backed HTTP/orchestration and an instrumented binary via
+`CARGO_BIN_EXE_answerbot`). CI runs `cargo test --locked` on every push and PR.
+
+Coverage: the authoritative gate is **line + region** via `cargo llvm-cov` on
+the pinned stable toolchain (`just coverage` fails under 100% lines or
+regions). Branch coverage (`--branch`) needs nightly (`just coverage-branch`)
+and is supplemental only. Coverage is not part of `just ci`.
 
 ## Conventions
 
@@ -53,7 +65,7 @@ Tests live in `tests/` as integration tests against the helpers in
 - **Dependencies**: `Cargo.lock` is committed (binary crate). New deps must
   pass `just deny` — if a new license appears, extend the allowlist in
   [deny.toml](deny.toml) with exactly that license, nothing broader.
-- **Comment style**: `main.rs` uses section-banner comments tied to the
+- **Comment style**: `run.rs` uses section-banner comments tied to the
   numbered flow in the README. Keep new code consistent with that structure and
   update the README table if the flow changes.
 
@@ -61,12 +73,14 @@ Tests live in `tests/` as integration tests against the helpers in
 
 Secrets (API keys) are loaded from `.env` at the repo root (via `dotenvy`):
 `OPENROUTER_API_KEY`, `FIRECRAWL_API_KEY`. The model itself is selected in
-`config/models.json` (parsed by `parse_config` in `src/lib.rs`), not via an
-env var. The file is gitignored — copy `config/models.json.example` locally.
+`config.toml` (parsed by `parse_config` in `src/lib.rs`), not via an
+env var. The file is gitignored — copy `config.toml.example` locally.
 Path overrides (optional):
 
-- `ANSWERBOT_CONFIG` — models JSON path (default `config/models.json`)
+- `ANSWERBOT_CONFIG` — config TOML path (default `config.toml`)
 - `ANSWERBOT_JOURNAL` — journal file path (default `journal.jsonl`)
+- `ANSWERBOT_OPENROUTER_URL` / `ANSWERBOT_FIRECRAWL_URL` — upstream base URLs
+  (defaults are the public hosts; tests / self-hosted proxies may override)
 
 Paths are relative to the process CWD unless absolute. Run from the repo root
 or set the overrides.
@@ -91,4 +105,4 @@ Read-only dependency source repositories are available under
   `v2.11.117` (sparse-checked-out to `apps/api/src/controllers/v2/` and
   `apps/api/src/search/v2/`); authoritative source for the `/v2/search`
   request/response schema and handler that `answerbot`'s hand-rolled reqwest
-  client in `src/main.rs:search()` is coupled to.
+  client in `src/search.rs` is coupled to.

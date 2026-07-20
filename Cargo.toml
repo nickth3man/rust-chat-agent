@@ -16,6 +16,11 @@ regex = "1"
 chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }
 # Loads variables from .env into the process environment at startup.
 dotenvy = "0.15"
+toml = "1.1.3"
+
+[dev-dependencies]
+wiremock = "0.6"
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "time"] }
 
 [lints.rust]
 unsafe_code = "forbid"

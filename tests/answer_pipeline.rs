@@ -433,6 +433,36 @@ fn rewrite_with_anchor_appends_for_this_year() {
 }
 
 #[test]
+fn rewrite_with_anchor_appends_for_remaining_phrases() {
+    // Pokayoke: every ANCHOR_PHRASES entry must trigger (except those covered
+    // by dedicated tests above). Prevents silent regex/list drift.
+    let today = "2026-07-18";
+    let cases = [
+        (
+            "What happened yesterday?",
+            "What happened yesterday? (as of 2026-07-18)",
+        ),
+        (
+            "What happens tomorrow?",
+            "What happens tomorrow? (as of 2026-07-18)",
+        ),
+        ("News this month?", "News this month? (as of 2026-07-18)"),
+        ("News this week?", "News this week? (as of 2026-07-18)"),
+        (
+            "Results this quarter?",
+            "Results this quarter? (as of 2026-07-18)",
+        ),
+        (
+            "Recently announced?",
+            "Recently announced? (as of 2026-07-18)",
+        ),
+    ];
+    for (q, expected) in cases {
+        assert_eq!(rewrite_with_anchor(q, today), expected, "phrase in: {q}");
+    }
+}
+
+#[test]
 fn rewrite_with_anchor_is_case_insensitive() {
     assert_eq!(
         rewrite_with_anchor("LATEST version of Rust", "2026-07-18"),

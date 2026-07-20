@@ -1,11 +1,13 @@
-// Tests for the pure orchestration helpers in src/lib.rs: parse_config,
+// Tests for the pure orchestration helpers in src/lib.rs: parse_config (TOML),
 // parse_requery, registry_contains_url, next_source_id, has_citations,
 // truncate_content.
 
 use answerbot::{
-    extract_answer_text, has_citations, next_source_id, parse_config, parse_firecrawl_web,
-    parse_requery, parse_rewrite_query_arg, registry_contains_url, should_reject_late_requery,
-    truncate_content, FirecrawlWebResult, RewriteQueryReject,
+    cited_sources, extract_answer_text, first_answer_decision, has_citations, ingest_web_results,
+    load_config_from, next_source_id, parse_config, parse_firecrawl_web, parse_requery,
+    parse_rewrite_query_arg, parse_rewrite_tool_arguments, post_answer_decision,
+    registry_contains_url, should_reject_late_requery, truncate_content, FirecrawlWebResult,
+    FirstAnswerDecision, PostAnswerDecision, RewriteQueryReject, RewriteToolReject,
 };
 mod common;
 
@@ -55,11 +57,11 @@ fn assert_f64_eq(a: f64, b: f64) {
     );
 }
 
-// -- parse_config: JSON config parsing / error paths / defaults ------------
+// -- parse_config: TOML config parsing / error paths / defaults ------------
 
 #[test]
-fn parse_config_valid_json() {
-    let config = parse_config(r#"{"model": "test-model"}"#).unwrap();
+fn parse_config_valid_toml() {
+    let config = parse_config(r#"model = "test-model""#).unwrap();
     assert_eq!(config.model, "test-model");
     assert_f64_eq(config.temperature, 0.7); // default
     assert!(config.reasoning); // default true
@@ -67,16 +69,23 @@ fn parse_config_valid_json() {
 
 #[test]
 fn parse_config_all_fields() {
-    let config = parse_config(r#"{"model": "m", "temperature": 0.5, "reasoning": false}"#).unwrap();
+    let config = parse_config(
+        r#"
+model = "m"
+temperature = 0.5
+reasoning = false
+"#,
+    )
+    .unwrap();
     assert_eq!(config.model, "m");
     assert_f64_eq(config.temperature, 0.5);
     assert!(!config.reasoning);
 }
 
 #[test]
-fn parse_config_invalid_json_is_error() {
-    let result = parse_config("not-json-at-all");
-    assert!(result.is_err(), "invalid JSON must produce an error");
+fn parse_config_invalid_toml_is_error() {
+    let result = parse_config("not-toml-at-all");
+    assert!(result.is_err(), "invalid TOML must produce an error");
 }
 
 #[test]
@@ -87,15 +96,21 @@ fn parse_config_empty_string_is_error() {
 
 #[test]
 fn parse_config_extra_fields_ignored() {
-    let config =
-        parse_config(r#"{"model": "m", "nonexistent": "ignored", "temperature": 0.1}"#).unwrap();
+    let config = parse_config(
+        r#"
+model = "m"
+nonexistent = "ignored"
+temperature = 0.1
+"#,
+    )
+    .unwrap();
     assert_eq!(config.model, "m");
     assert_f64_eq(config.temperature, 0.1);
 }
 
 #[test]
 fn parse_config_missing_model_is_error() {
-    let result = parse_config(r#"{"temperature": 0.5}"#);
+    let result = parse_config("temperature = 0.5");
     assert!(result.is_err(), "missing required field 'model' must error");
 }
 
@@ -504,4 +519,291 @@ fn parse_firecrawl_web_defaults_optional_fields() {
     assert_eq!(results[0].title, "");
     assert_eq!(results[0].markdown, None);
     assert_eq!(results[0].description, None);
+}
+
+// -- ingest_web_results: dedup / truncate / skip-empty / contiguous IDs ----
+
+fn web(
+    url: &str,
+    title: &str,
+    markdown: Option<&str>,
+    description: Option<&str>,
+) -> FirecrawlWebResult {
+    FirecrawlWebResult {
+        url: url.into(),
+        title: title.into(),
+        markdown: markdown.map(str::to_string),
+        description: description.map(str::to_string),
+    }
+}
+
+#[test]
+fn ingest_web_results_happy_path_assigns_contiguous_ids() {
+    let mut registry = Vec::new();
+    let added = ingest_web_results(
+        &mut registry,
+        vec![
+            web("https://a.com", "A", Some("body a"), None),
+            web("https://b.com", "B", Some("body b"), None),
+        ],
+        8_000,
+    );
+    assert_eq!(added, 2);
+    assert_eq!(registry.len(), 2);
+    assert_eq!(registry[0].id, "S1");
+    assert_eq!(registry[1].id, "S2");
+    assert_eq!(registry[0].content, "body a");
+    assert_eq!(registry[1].title, "B");
+}
+
+#[test]
+fn ingest_web_results_dedups_by_url() {
+    let mut registry = vec![full_src("S1", "Existing", "https://a.com", "old")];
+    let added = ingest_web_results(
+        &mut registry,
+        vec![
+            web("https://a.com", "Dup", Some("new"), None),
+            web("https://b.com", "B", Some("body b"), None),
+        ],
+        8_000,
+    );
+    assert_eq!(added, 1);
+    assert_eq!(registry.len(), 2);
+    assert_eq!(registry[0].content, "old");
+    assert_eq!(registry[1].id, "S2");
+    assert_eq!(registry[1].url, "https://b.com");
+}
+
+#[test]
+fn ingest_web_results_skips_empty_content() {
+    let mut registry = Vec::new();
+    let added = ingest_web_results(
+        &mut registry,
+        vec![
+            web("https://empty.com", "E", None, None),
+            web("https://ok.com", "O", Some("text"), None),
+        ],
+        8_000,
+    );
+    assert_eq!(added, 1);
+    assert_eq!(registry.len(), 1);
+    assert_eq!(registry[0].id, "S1");
+    assert_eq!(registry[0].url, "https://ok.com");
+}
+
+#[test]
+fn ingest_web_results_prefers_markdown_over_description() {
+    let mut registry = Vec::new();
+    ingest_web_results(
+        &mut registry,
+        vec![web(
+            "https://a.com",
+            "A",
+            Some("full markdown"),
+            Some("snippet only"),
+        )],
+        8_000,
+    );
+    assert_eq!(registry[0].content, "full markdown");
+}
+
+#[test]
+fn ingest_web_results_falls_back_to_description() {
+    let mut registry = Vec::new();
+    ingest_web_results(
+        &mut registry,
+        vec![web("https://a.com", "A", None, Some("snippet"))],
+        8_000,
+    );
+    assert_eq!(registry[0].content, "snippet");
+}
+
+#[test]
+fn ingest_web_results_truncates_to_max_chars() {
+    let mut registry = Vec::new();
+    ingest_web_results(
+        &mut registry,
+        vec![web("https://a.com", "A", Some("abcdefghij"), None)],
+        5,
+    );
+    assert_eq!(registry[0].content, "abcde");
+}
+
+// -- first_answer_decision / post_answer_decision: SEARCH + citation gates -
+
+#[test]
+fn first_answer_decision_requery() {
+    assert_eq!(
+        first_answer_decision("SEARCH: better query"),
+        FirstAnswerDecision::Requery("better query".into())
+    );
+}
+
+#[test]
+fn first_answer_decision_proceed() {
+    assert_eq!(
+        first_answer_decision("Paris is the capital [S1]."),
+        FirstAnswerDecision::Proceed
+    );
+    assert_eq!(
+        first_answer_decision("SEARCH:"),
+        FirstAnswerDecision::Proceed
+    );
+}
+
+#[test]
+fn post_answer_decision_accepts_cited_answer() {
+    let registry = vec![src("S1")];
+    assert_eq!(
+        post_answer_decision("Paris [S1].", &registry),
+        PostAnswerDecision::Accept
+    );
+}
+
+#[test]
+fn post_answer_decision_retries_when_no_citations() {
+    let registry = vec![src("S1")];
+    assert_eq!(
+        post_answer_decision("Paris is the capital.", &registry),
+        PostAnswerDecision::RetryForCitations
+    );
+}
+
+#[test]
+fn post_answer_decision_late_requery_beats_citation_retry() {
+    // SEARCH: answers have no [Sn] citations. Ordering must reject late
+    // requery *before* classifying as a zero-citation retry.
+    let registry = vec![src("S1")];
+    assert_eq!(
+        post_answer_decision("SEARCH: another try", &registry),
+        PostAnswerDecision::RejectLateRequery
+    );
+}
+
+#[test]
+fn post_answer_decision_accepts_uncited_when_registry_empty() {
+    assert_eq!(
+        post_answer_decision("no sources available", &[]),
+        PostAnswerDecision::Accept
+    );
+}
+
+// -- parse_rewrite_tool_arguments: no-HTTP rewrite shape failures ----------
+
+#[test]
+fn parse_rewrite_tool_arguments_happy_path() {
+    let q = parse_rewrite_tool_arguments(Some(r#"{"query":"capital of France"}"#)).unwrap();
+    assert_eq!(q, "capital of France");
+}
+
+#[test]
+fn parse_rewrite_tool_arguments_no_tool_call() {
+    let err = parse_rewrite_tool_arguments(None).unwrap_err();
+    assert_eq!(err, RewriteToolReject::NoToolCall);
+    assert_eq!(err.reason(), "no-tool-call");
+}
+
+#[test]
+fn parse_rewrite_tool_arguments_invalid_args() {
+    let err = parse_rewrite_tool_arguments(Some("not-json")).unwrap_err();
+    assert_eq!(err, RewriteToolReject::InvalidArgs);
+    assert_eq!(err.reason(), "invalid-tool-args");
+}
+
+#[test]
+fn parse_rewrite_tool_arguments_missing_query() {
+    let err = parse_rewrite_tool_arguments(Some(r#"{"other":"x"}"#)).unwrap_err();
+    assert_eq!(err, RewriteToolReject::MissingQuery);
+    assert_eq!(err.reason(), "missing-query-field");
+}
+
+#[test]
+fn parse_rewrite_tool_arguments_empty_query() {
+    let err = parse_rewrite_tool_arguments(Some(r#"{"query":"  "}"#)).unwrap_err();
+    assert_eq!(err, RewriteToolReject::EmptyQuery);
+    assert_eq!(err.reason(), "empty-query");
+}
+
+// -- RewriteToolReject::into_final_error: exhaustion messages ---------------
+
+#[test]
+fn into_final_error_no_tool_call() {
+    let err = RewriteToolReject::NoToolCall.into_final_error(5);
+    let msg = format!("{err:#}");
+    assert!(msg.contains("after 5 attempts"), "{msg}");
+    assert!(msg.contains("did not return a tool call"), "{msg}");
+}
+
+#[test]
+fn into_final_error_invalid_args() {
+    let err = RewriteToolReject::InvalidArgs.into_final_error(3);
+    let msg = format!("{err:#}");
+    assert!(msg.contains("after 3 attempts"), "{msg}");
+    assert!(msg.contains("valid arguments JSON"), "{msg}");
+}
+
+#[test]
+fn into_final_error_missing_query() {
+    let err = RewriteToolReject::MissingQuery.into_final_error(2);
+    let msg = format!("{err:#}");
+    assert!(msg.contains("after 2 attempts"), "{msg}");
+    assert!(msg.contains("missing 'query' field"), "{msg}");
+}
+
+#[test]
+fn into_final_error_empty_query() {
+    let err = RewriteToolReject::EmptyQuery.into_final_error(1);
+    let msg = format!("{err:#}");
+    assert!(msg.contains("after 1 attempts"), "{msg}");
+    assert!(msg.contains("empty 'query' field"), "{msg}");
+}
+
+// -- cited_sources: Sources footer filter ----------------------------------
+
+#[test]
+fn cited_sources_filters_to_mentioned_ids_in_registry_order() {
+    let registry = vec![
+        full_src("S1", "One", "https://1.com", "a"),
+        full_src("S2", "Two", "https://2.com", "b"),
+        full_src("S3", "Three", "https://3.com", "c"),
+    ];
+    let cited = cited_sources("Uses [S3] and [S1] only.", &registry);
+    assert_eq!(cited.len(), 2);
+    assert_eq!(cited[0].id, "S1");
+    assert_eq!(cited[1].id, "S3");
+}
+
+#[test]
+fn cited_sources_empty_when_none_cited() {
+    let registry = vec![src("S1")];
+    assert!(cited_sources("no markers here", &registry).is_empty());
+}
+
+// -- load_config_from: filesystem path (no network) ------------------------
+
+#[test]
+fn load_config_from_valid_file() {
+    let dir = std::env::temp_dir();
+    let path = dir.join(format!("answerbot-config-ok-{}.toml", std::process::id()));
+    std::fs::write(&path, "model = \"test-model\"\ntemperature = 0.3\n").unwrap();
+    let config = load_config_from(&path).expect("valid file must load");
+    let _ = std::fs::remove_file(&path);
+    assert_eq!(config.model, "test-model");
+    assert_f64_eq(config.temperature, 0.3);
+}
+
+#[test]
+fn load_config_from_missing_file_is_error() {
+    let path = std::env::temp_dir().join(format!(
+        "answerbot-config-missing-{}.toml",
+        std::process::id()
+    ));
+    let _ = std::fs::remove_file(&path);
+    let Err(err) = load_config_from(&path) else {
+        panic!("missing file must error");
+    };
+    assert!(
+        err.to_string().contains("failed to read"),
+        "unexpected error: {err}"
+    );
 }

@@ -15,7 +15,7 @@ and every step lands in `journal.jsonl`.
 3. Copy `.env.example` to `.env` and fill in:
     - `OPENROUTER_API_KEY`
     - `FIRECRAWL_API_KEY`
-4. Copy `config/models.json.example` to `config/models.json` and choose a
+4. Copy `config.toml.example` to `config.toml` and choose a
    model (model name and temperature). The real file is gitignored.
 5. Run:
 
@@ -25,15 +25,15 @@ cargo run --release -- "what changed in the latest Rust edition?"
 
 ## How the code maps to the flow
 
-| Flow step | Where in `src/main.rs` |
+| Flow step | Where |
 |---|---|
-| You ask | `main()` reads the command line |
-| AI writes one search query | `rewrite_llm()` (forced `generate_search_query` tool) |
-| Firecrawl finds + reads pages in one trip | `search()` |
-| AI answers from sources | `llm()` (plain chat — no tools) |
-| One re-search allowed if needed | answer text starts with `SEARCH:` → host runs `search()` again |
-| Citations kept honest | the regex strip near the end |
-| Everything noted in one file | `journal()` → `journal.jsonl` (or `ANSWERBOT_JOURNAL`) |
+| You ask | `run_cli()` / `run()` in `src/run.rs` (binary is `src/main.rs`) |
+| AI writes one search query | `rewrite_llm()` in `src/llm.rs` (forced `generate_search_query` tool) |
+| Firecrawl finds + reads pages in one trip | `search()` in `src/search.rs` |
+| AI answers from sources | `llm()` in `src/llm.rs` (plain chat — no tools) |
+| One re-search allowed if needed | answer text starts with `SEARCH:` → host runs `search()` again (`src/run.rs`) |
+| Citations kept honest | helpers in `src/lib.rs` near the end of `run()` |
+| Everything noted in one file | `journal()` in `src/journal.rs` → `journal.jsonl` (or `ANSWERBOT_JOURNAL`) |
 
 There are two different “search” mechanisms:
 
@@ -46,15 +46,13 @@ There are two different “search” mechanisms:
 
 ## Configuration
 
-Model selection and tuning live in `config/models.json` (gitignored local
-file — copy from `config/models.json.example`; there is no built-in default):
+Model selection and tuning live in `config.toml` (gitignored local file —
+copy from `config.toml.example`; there is no built-in default):
 
-```json
-{
-  "model": "your-openrouter-model-id",
-  "temperature": 0.7,
-  "reasoning": true
-}
+```toml
+model = "your-openrouter-model-id"
+temperature = 0.7
+reasoning = true
 ```
 
 - `model` — OpenRouter model id (browse all at https://openrouter.ai/models)
@@ -69,8 +67,10 @@ The compatibility table below is a tested set, not a recommended default.
 Secrets (API keys) stay in `.env`. Optional path overrides (CWD-relative unless
 absolute):
 
-- `ANSWERBOT_CONFIG` — models JSON (default `config/models.json`)
+- `ANSWERBOT_CONFIG` — config TOML (default `config.toml`)
 - `ANSWERBOT_JOURNAL` — journal file (default `journal.jsonl`)
+- `ANSWERBOT_OPENROUTER_URL` / `ANSWERBOT_FIRECRAWL_URL` — upstream base URLs
+  (for tests or self-hosted proxies)
 
 Run from the repo root, or set these when the CWD differs.
 

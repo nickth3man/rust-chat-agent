@@ -1,5 +1,7 @@
 # Development tasks. One-time setup:
-#   cargo install --locked just cargo-deny
+#   cargo install --locked just cargo-deny cargo-llvm-cov
+# The pinned toolchain (rust-toolchain.toml) includes llvm-tools-preview
+# for cargo-llvm-cov; rustup installs it with `rustup show`.
 
 # List available recipes.
 default:
@@ -33,9 +35,25 @@ test:
 run question:
     cargo run -- "{{question}}"
 
-# Run coverage (needs cargo-llvm-cov installed; reports lib.rs + extracted helpers).
+# Coverage: line + region on the pinned stable toolchain (authoritative gate).
+# Needs cargo-llvm-cov + llvm-tools-preview. Fails under 100% line or region.
 coverage:
-    cargo llvm-cov --all-targets
+    cargo llvm-cov --locked --fail-under-lines 100 --fail-under-regions 100
 
-# Everything CI runs, locally.
+# Coverage with text report (and HTML under target/llvm-cov/html).
+coverage-report:
+    cargo llvm-cov --locked --html --text --fail-under-lines 100 --fail-under-regions 100
+    @echo "HTML report: target/llvm-cov/html/index.html"
+
+# Coverage JSON summary for scripting (written to target/llvm-cov-summary.json).
+coverage-json:
+    cargo llvm-cov --locked --json --summary-only --fail-under-lines 100 --fail-under-regions 100 --output-path target/llvm-cov-summary.json
+
+# Branch coverage (supplemental). Requires a nightly toolchain:
+#   rustup toolchain install nightly
+# Not part of `just ci`; branch instrumentation needs -Z flags unavailable on stable.
+coverage-branch:
+    cargo +nightly llvm-cov --locked --branch --fail-under-lines 100 --fail-under-regions 100
+
+# Everything CI runs, locally. (Coverage is a separate local gate — not in CI.)
 ci: fmt-check lint check test deny

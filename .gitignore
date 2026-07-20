@@ -13,8 +13,8 @@
 !.env.example
 
 # Local model selection (operator preference); keep the example template tracked.
-config/models.json
-!config/models.json.example
+config.toml
+!config.toml.example
 
 # --- Editors / IDEs ---
 # Shared editor config is tracked; everything else in .vscode/ is personal.

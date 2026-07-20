@@ -14,7 +14,7 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
 RESULTS = ROOT / "results"
-CONFIG = ROOT / "config" / "models.json"
+CONFIG = ROOT / "config.toml"
 QUERIES_FILE = ROOT / "tests" / "queries.txt"
 
 # (model_id, reasoning_enabled)
@@ -27,8 +27,12 @@ MODELS = [
 
 
 def write_config(model: str, reasoning: bool):
-    config = {"model": model, "temperature": 0.7, "reasoning": reasoning}
-    CONFIG.write_text(json.dumps(config, indent=2) + "\n")
+    CONFIG.write_text(
+        f'model = "{model}"\n'
+        f"temperature = 0.7\n"
+        f"reasoning = {'true' if reasoning else 'false'}\n",
+        encoding="utf-8",
+    )
 
 
 def load_queries() -> list[tuple[int, str]]:
@@ -113,8 +117,8 @@ def main():
 
     # Backup original config so we can always restore it, even if the run is
     # interrupted (Ctrl-C, exception, or timeout unwinding). Without this,
-    # an aborted eval leaves config/models.json pointing at the last model
-    # under test instead of the user's configured model.
+    # an aborted eval leaves config.toml pointing at the last model under
+    # test instead of the user's configured model.
     backup_config = CONFIG.read_text(encoding="utf-8") if CONFIG.exists() else None
 
     try:

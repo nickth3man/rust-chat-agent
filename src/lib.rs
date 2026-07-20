@@ -1,16 +1,29 @@
-// answerbot — the pure LLM-facing helpers extracted from the binary.
+// answerbot — research agent library.
 //
-// These types and functions have no I/O, no env access, and no network. They
-// live in the library crate so the integration tests in `tests/` can
-// exercise them without standing up the full binary. The binary in
-// `src/main.rs` imports them and owns the orchestration: env loading, LLM
-// calls, Firecrawl calls, journaling, and printing.
+// This module holds the pure LLM-facing helpers (no I/O, no env access, no
+// network): `Source`, prompt formatting, citation validation, config
+// parsing, and Firecrawl response parsing. The orchestration — env loading,
+// HTTP retries, LLM/Firecrawl calls, journaling, and printing — lives in the
+// sibling modules below (`paths`, `journal`, `http`, `llm`, `search`,
+// `run`), all built on top of these pure helpers so the whole flow is
+// testable against wiremock servers instead of the real, billed APIs.
+// `src/main.rs` is a one-line wrapper around `run::run_cli`.
+
+pub mod http;
+pub mod journal;
+pub mod llm;
+pub mod paths;
+pub mod run;
+pub mod search;
+
+pub use run::{load_dotenv, run_cli};
 
 use anyhow::{Context, Result};
 use regex::Regex;
 use serde::Deserialize;
 use serde_json::Value;
 use std::collections::HashSet;
+use std::path::Path;
 use std::sync::LazyLock;
 
 /// One fetched page. The `id` (S1, S2, ...) is what the answer cites.
@@ -171,7 +184,7 @@ pub fn rewrite_with_anchor(question: &str, today: &str) -> String {
 // Orchestration helpers
 // ---------------------------------------------------------------------------
 
-/// Runtime model configuration loaded from config/models.json.
+/// Runtime model configuration loaded from config.toml.
 #[derive(Deserialize)]
 pub struct Config {
     pub model: String,
@@ -190,9 +203,21 @@ fn default_true() -> bool {
     true
 }
 
-/// Parse a Config from raw JSON string contents.
+/// Parse a Config from raw TOML string contents.
 pub fn parse_config(contents: &str) -> Result<Config> {
-    serde_json::from_str(contents).context("failed to parse config")
+    toml::from_str(contents).context("failed to parse config")
+}
+
+/// Read and parse a Config from a filesystem path (e.g. `config.toml`).
+pub fn load_config_from(path: impl AsRef<Path>) -> Result<Config> {
+    let path = path.as_ref();
+    let contents = std::fs::read_to_string(path).with_context(|| {
+        format!(
+            "failed to read {} (set ANSWERBOT_CONFIG or run from the repo root)",
+            path.display()
+        )
+    })?;
+    parse_config(&contents)
 }
 
 fn trimmed_non_empty(s: &str) -> Option<&str> {
@@ -216,6 +241,48 @@ pub fn should_reject_late_requery(answer: &str) -> bool {
     parse_requery(answer).is_some()
 }
 
+/// What to do with the model's first answering turn.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum FirstAnswerDecision {
+    /// Model requested the one allowed re-search.
+    Requery(String),
+    /// Proceed to citation stripping / late-requery / zero-citation gates.
+    Proceed,
+}
+
+/// Classify the first answering LLM turn: allow exactly one `SEARCH:` requery.
+pub fn first_answer_decision(answer: &str) -> FirstAnswerDecision {
+    match parse_requery(answer) {
+        Some(q) => FirstAnswerDecision::Requery(q),
+        None => FirstAnswerDecision::Proceed,
+    }
+}
+
+/// What to do after stripping invalid citations from an answer.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PostAnswerDecision {
+    /// A further `SEARCH:` after the one allowed re-search (or after the
+    /// citation-retry insist path). Must be checked *before* the zero-citation
+    /// retry so a late requery does not burn an extra LLM call.
+    RejectLateRequery,
+    /// Answer looks fine but has no `[Sn]` citations — one insist retry.
+    RetryForCitations,
+    /// Print the answer.
+    Accept,
+}
+
+/// Decide the next step after `strip_invalid_citations`. Ordering is part of
+/// the contract: late `SEARCH:` wins over the zero-citation retry.
+pub fn post_answer_decision(clean: &str, registry: &[Source]) -> PostAnswerDecision {
+    if should_reject_late_requery(clean) {
+        return PostAnswerDecision::RejectLateRequery;
+    }
+    if !has_citations(clean) && !registry.is_empty() {
+        return PostAnswerDecision::RetryForCitations;
+    }
+    PostAnswerDecision::Accept
+}
+
 /// Pull a non-empty trimmed `query` from rewrite tool-call arguments JSON.
 ///
 /// Distinguishes a missing/non-string `query` field from a present but blank
@@ -236,6 +303,80 @@ pub enum RewriteQueryReject {
     Missing,
     /// `query` present but empty/whitespace-only after trim.
     Empty,
+}
+
+/// Shape failures from a forced rewrite tool call (no HTTP).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RewriteToolReject {
+    /// No tool call present in the response.
+    NoToolCall,
+    /// Tool-call `arguments` string was not valid JSON.
+    InvalidArgs,
+    /// Parsed JSON but `query` missing / wrong type.
+    MissingQuery,
+    /// `query` present but blank after trim.
+    EmptyQuery,
+}
+
+impl RewriteToolReject {
+    /// Journal / retry reason label (stable for operators and tests).
+    pub fn reason(self) -> &'static str {
+        match self {
+            Self::NoToolCall => "no-tool-call",
+            Self::InvalidArgs => "invalid-tool-args",
+            Self::MissingQuery => "missing-query-field",
+            Self::EmptyQuery => "empty-query",
+        }
+    }
+
+    /// Final error after `REWRITE_MAX_ATTEMPTS` are exhausted.
+    pub fn into_final_error(self, attempts: u32) -> anyhow::Error {
+        match self {
+            Self::NoToolCall => anyhow::Error::msg("rewrite: model did not return a tool call")
+                .context(format!("after {attempts} attempts")),
+            Self::InvalidArgs => {
+                anyhow::Error::msg("rewrite: tool call missing valid arguments JSON")
+                    .context(format!("after {attempts} attempts"))
+            }
+            Self::MissingQuery => {
+                anyhow::Error::msg("rewrite: tool call arguments missing 'query' field")
+                    .context(format!("after {attempts} attempts"))
+            }
+            Self::EmptyQuery => {
+                anyhow::Error::msg("rewrite: tool call arguments had empty 'query' field")
+                    .context(format!("after {attempts} attempts"))
+            }
+        }
+    }
+}
+
+impl From<RewriteQueryReject> for RewriteToolReject {
+    fn from(reject: RewriteQueryReject) -> Self {
+        match reject {
+            RewriteQueryReject::Missing => Self::MissingQuery,
+            RewriteQueryReject::Empty => Self::EmptyQuery,
+        }
+    }
+}
+
+/// Parse the search query from a forced `generate_search_query` tool call's
+/// `arguments` JSON string. Pass `None` when the response had no tool call.
+pub fn parse_rewrite_tool_arguments(arguments: Option<&str>) -> Result<String, RewriteToolReject> {
+    let Some(arguments) = arguments else {
+        return Err(RewriteToolReject::NoToolCall);
+    };
+    let args: Value =
+        serde_json::from_str(arguments).map_err(|_| RewriteToolReject::InvalidArgs)?;
+    parse_rewrite_query_arg(&args).map_err(RewriteToolReject::from)
+}
+
+/// Registry entries whose `[Sn]` tag appears in `clean` (Sources footer filter).
+/// Preserves registry order.
+pub fn cited_sources<'a>(clean: &str, registry: &'a [Source]) -> Vec<&'a Source> {
+    registry
+        .iter()
+        .filter(|s| clean.contains(&format!("[{}]", s.id)))
+        .collect()
 }
 
 /// Check whether a URL is already in the source registry (dedup helper).
@@ -346,6 +487,38 @@ pub fn parse_firecrawl_web(resp: &Value) -> Result<Vec<FirecrawlWebResult>> {
         .context("Firecrawl /v2/search: missing or null data.web field")?;
     serde_json::from_value(web_value.clone())
         .context("Firecrawl /v2/search: data.web entries failed to deserialize")
+}
+
+/// Merge Firecrawl web results into the source registry.
+///
+/// Dedups by URL (skip already-registered), prefers `markdown` over
+/// `description`, truncates to `max_chars`, and skips empty bodies. Returns
+/// the slice of newly appended sources (for journaling). IDs stay contiguous
+/// via `next_source_id`.
+pub fn ingest_web_results(
+    registry: &mut Vec<Source>,
+    results: impl IntoIterator<Item = FirecrawlWebResult>,
+    max_chars: usize,
+) -> usize {
+    let before = registry.len();
+    for r in results {
+        if registry_contains_url(registry, &r.url) {
+            continue;
+        }
+        let mut content = r.markdown.or(r.description).unwrap_or_default();
+        truncate_content(&mut content, max_chars);
+        if content.is_empty() {
+            continue;
+        }
+        let id = next_source_id(registry);
+        registry.push(Source {
+            id,
+            url: r.url,
+            title: r.title,
+            content,
+        });
+    }
+    registry.len() - before
 }
 
 const QUERY_SYSTEM_TEMPLATE: &str = "\

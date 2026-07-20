@@ -1,5 +1,0 @@
-{
-  "model": "your-openrouter-model-id",
-  "temperature": 0.7,
-  "reasoning": true
-}
